@@ -386,6 +386,7 @@ modify_node(Bt, RootPointerInfo, Actions, QueryOutput) ->
         Pointer = element(1, RootPointerInfo),
         {NodeType, NodeList} = get_node(Bt, Pointer)
     end,
+    %% NodeList 应该是升序的key
     NodeTuple = list_to_tuple(NodeList),
 
     {ok, NewNodeList, QueryOutput2} =
@@ -402,11 +403,14 @@ modify_node(Bt, RootPointerInfo, Actions, QueryOutput) ->
     _Else2 ->
         {ok, ResultList} = case RootPointerInfo of
         nil ->
+            %% 添加第一个Doc的时候会直接写node
             write_node(Bt, NodeType, NewNodeList);
         _ ->
+            %% 得到最大的Key
             {LastKey, _LastValue} = element(tuple_size(NodeTuple), NodeTuple),
+            %% 旧Root节点
             OldNode = {LastKey, RootPointerInfo},
-            write_node(Bt, OldNode, NodeType, NodeList, NewNodeList)
+            write_node(Bt, OldNode, NodeType, NodeList, NewNodeList) %% 写入Doc
         end,
         {ok, ResultList, QueryOutput2}
     end.
