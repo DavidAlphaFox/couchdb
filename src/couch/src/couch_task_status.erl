@@ -24,7 +24,7 @@
 % {pid, ErlangPid} are automatically added by this module.
 % When a tracked task dies, its status will be automatically removed from
 % memory. To get the tasks list, call the all/0 function.
-
+%% 用来追踪所有长时间运行的任务进程
 -export([start_link/0, stop/0]).
 -export([all/0, add_task/1, update/1, get/1, set_update_frequency/1]).
 -export([is_task_added/0]).
@@ -105,6 +105,7 @@ persist(TaskProps0) ->
 
 init([]) ->
     % read configuration settings and register for configuration changes
+    %% 创建命名ets，来管理任务
     ets:new(?MODULE, [ordered_set, protected, named_table]),
     {ok, nil}.
 

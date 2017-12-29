@@ -132,11 +132,11 @@
 
 start_link(DbName, Filepath, Options) ->
     case open_db_file(Filepath, Options) of
-    {ok, Fd} ->
+    {ok, Fd} -> %%  文件打开成功了
         {ok, UpdaterPid} = gen_server:start_link(couch_db_updater, {DbName,
             Filepath, Fd, Options}, []),
-        unlink(Fd),
-        gen_server:call(UpdaterPid, get_db);
+        unlink(Fd), %% 解除文件关联
+        gen_server:call(UpdaterPid, get_db); %% 获取DB
     Else ->
         Else
     end.
@@ -148,7 +148,7 @@ open_db_file(Filepath, Options) ->
     {error, enoent} ->
         % couldn't find file. is there a compact version? This can happen if
         % crashed during the file switch.
-        case couch_file:open(Filepath ++ ".compact", [nologifmissing]) of
+        case couch_file:open(Filepath ++ ".compact", [nologifmissing]) of %%尝试打开压缩文件
         {ok, Fd} ->
             couch_log:info("Found ~s~s compaction file, using as primary"
                            " storage.", [Filepath, ".compact"]),

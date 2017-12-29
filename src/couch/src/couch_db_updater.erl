@@ -43,7 +43,7 @@ init({DbName, Filepath, Fd, Options}) ->
     case lists:member(create, Options) of
     true ->
         % create a new header and writes it to the file
-        Header =  couch_db_header:new(),
+        Header =  couch_db_header:new(), %% 创建新的header
         ok = couch_file:write_header(Fd, Header),
         % delete any old compaction files that might be hanging around
         RootDir = config:get("couchdb", "database_dir", "."),
@@ -570,22 +570,22 @@ btree_by_seq_reduce(rereduce, Reds) ->
     lists:sum(Reds).
 
 init_db(DbName, Filepath, Fd, Header0, Options) ->
-    Header = couch_db_header:upgrade(Header0),
-
+    Header = couch_db_header:upgrade(Header0), %% 升级header
+    
     {ok, FsyncOptions} = couch_util:parse_term(
             config:get("couchdb", "fsync_options",
                     "[before_header, after_header, on_file_open]")),
 
     case lists:member(on_file_open, FsyncOptions) of
-    true -> ok = couch_file:sync(Fd);
+    true -> ok = couch_file:sync(Fd); %% 同步数据
     _ -> ok
     end,
 
     Compression = couch_compress:get_compression_method(),
 
-    IdTreeState = couch_db_header:id_tree_state(Header),
-    SeqTreeState = couch_db_header:seq_tree_state(Header),
-    LocalTreeState = couch_db_header:local_tree_state(Header),
+    IdTreeState = couch_db_header:id_tree_state(Header), %% 得到ID树
+    SeqTreeState = couch_db_header:seq_tree_state(Header),%% 得到序列树
+    LocalTreeState = couch_db_header:local_tree_state(Header),%% 得到状态树
     {ok, IdBtree} = couch_btree:open(IdTreeState, Fd,
         [{split, fun ?MODULE:btree_by_id_split/1},
         {join, fun ?MODULE:btree_by_id_join/2},
@@ -609,7 +609,7 @@ init_db(DbName, Filepath, Fd, Header0, Options) ->
     {MegaSecs, Secs, MicroSecs} = os:timestamp(),
     StartTime = ?l2b(io_lib:format("~p",
             [(MegaSecs*1000000*1000000) + (Secs*1000000) + MicroSecs])),
-    ok = couch_file:set_db_pid(Fd, self()),
+    ok = couch_file:set_db_pid(Fd, self()), %% 将数据库的文件进程和自己关联
     Db = #db{
         fd=Fd,
         fd_monitor = erlang:monitor(process, Fd),

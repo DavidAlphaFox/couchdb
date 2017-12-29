@@ -186,23 +186,23 @@ close_db_if_idle(DbName) ->
             ok
     end.
 
-
+%% 主服务器
 init([]) ->
     % read config and register for configuration changes
 
     % just stop if one of the config settings change. couch_server_sup
     % will restart us and then we will pick up the new settings.
-
+    %% 获取启动参数，数据库目录，最大打开数据库数量，是否使用LRU
     RootDir = config:get("couchdb", "database_dir", "."),
     MaxDbsOpen = list_to_integer(
             config:get("couchdb", "max_dbs_open", integer_to_list(?MAX_DBS_OPEN))),
     UpdateLruOnRead =
         config:get("couchdb", "update_lru_on_read", "true") =:= "true",
     ok = config:listen_for_changes(?MODULE, nil),
-    ok = couch_file:init_delete_dir(RootDir),
-    hash_admin_passwords(),
-    ets:new(couch_dbs, [set, protected, named_table, {keypos, #entry.name}]),
-    ets:new(couch_dbs_pid_to_name, [set, protected, named_table]),
+    ok = couch_file:init_delete_dir(RootDir), %% 删除所有'database_dir'.delete下的文件
+    hash_admin_passwords(), %% 管理员密码
+    ets:new(couch_dbs, [set, protected, named_table, {keypos, #entry.name}]), %% 打开的db列表
+    ets:new(couch_dbs_pid_to_name, [set, protected, named_table]), %% 数据库进程和数据库映射
     process_flag(trap_exit, true),
     {ok, #server{root_dir=RootDir,
                 max_dbs_open=MaxDbsOpen,
@@ -307,15 +307,15 @@ open_async(Server, From, DbName, Filepath, Options) ->
     Parent = self(),
     T0 = os:timestamp(),
     Opener = spawn_link(fun() ->
-        Res = couch_db:start_link(DbName, Filepath, Options),
+        Res = couch_db:start_link(DbName, Filepath, Options), %% 数据库启动
         case {Res, lists:member(create, Options)} of
             {{ok, _Db}, true} ->
                 couch_event:notify(DbName, created);
             _ ->
                 ok
         end,
-        gen_server:call(Parent, {open_result, T0, DbName, Res}, infinity),
-        unlink(Parent)
+        gen_server:call(Parent, {open_result, T0, DbName, Res}, infinity), %% 报告打开结果
+        unlink(Parent) %% 减少不必要的事件
     end),
     ReqType = case lists:member(create, Options) of
         true -> create;
@@ -348,20 +348,20 @@ handle_call({set_max_dbs_open, Max}, _From, Server) ->
 handle_call(get_server, _From, Server) ->
     {reply, {ok, Server}, Server};
 handle_call({open_result, T0, DbName, {ok, Db}}, {FromPid, _Tag}, Server) ->
-    true = ets:delete(couch_dbs_pid_to_name, FromPid),
-    OpenTime = timer:now_diff(os:timestamp(), T0) / 1000,
-    couch_stats:update_histogram([couchdb, db_open_time], OpenTime),
-    DbPid = couch_db:get_pid(Db),
-    case ets:lookup(couch_dbs, DbName) of
-        [] ->
+    true = ets:delete(couch_dbs_pid_to_name, FromPid), %% 删掉打开进程
+    OpenTime = timer:now_diff(os:timestamp(), T0) / 1000, %%  打开时间戳
+    couch_stats:update_histogram([couchdb, db_open_time], OpenTime), %% 更新统计数据
+    DbPid = couch_db:get_pid(Db),%% 得到DB进程Pid
+    case ets:lookup(couch_dbs, DbName) of 
+        [] ->  %% 查不到，那么就关闭DB进程
             % db was deleted during async open
             exit(DbPid, kill),
             {reply, ok, Server};
         [#entry{req_type = ReqType, waiters = Waiters} = Entry] ->
-            link(DbPid),
+            link(DbPid), %% 关联DB进程，回复请求者
             [gen_server:reply(Waiter, {ok, Db}) || Waiter <- Waiters],
             % Cancel the creation request if it exists.
-            case ReqType of
+            case ReqType of %% 通知第二个创建者进程，取消创建
                 {create, DbName, _Filepath, _Options, CrFrom} ->
                     gen_server:reply(CrFrom, file_exists);
                 _ ->
@@ -374,11 +374,11 @@ handle_call({open_result, T0, DbName, {ok, Db}}, {FromPid, _Tag}, Server) ->
                 lock = unlocked,
                 db_options = Entry#entry.db_options,
                 start_time = couch_db:get_instance_start_time(Db)
-            }),
-            true = ets:insert(couch_dbs_pid_to_name, {DbPid, DbName}),
+            }),%% 更新数据，解除数据库锁定
+            true = ets:insert(couch_dbs_pid_to_name, {DbPid, DbName}),%% 增加影射关系
             Lru = case couch_db:is_system_db(Db) of
                 false ->
-                    couch_lru:insert(DbName, Server#server.lru);
+                    couch_lru:insert(DbName, Server#server.lru); %% 更新缓存
                 true ->
                     Server#server.lru
             end,
@@ -432,13 +432,13 @@ handle_call({open, DbName, Options}, From, Server) ->
     end;
 handle_call({create, DbName, Options}, From, Server) ->
     DbNameList = binary_to_list(DbName),
-    Filepath = get_full_filename(Server, DbNameList),
+    Filepath = get_full_filename(Server, DbNameList), %% 得到db文件名称
     case check_dbname(Server, DbNameList) of
-    ok ->
+    ok -> %% 名字是符合规则的
         case ets:lookup(couch_dbs, DbName) of
         [] ->
             case make_room(Server, Options) of
-            {ok, Server2} ->
+            {ok, Server2} -> %% 从LRU中获取空位置
                 {noreply, open_async(Server2, From, DbName, Filepath,
                         [create | Options])};
             CloseError ->

@@ -28,7 +28,9 @@
 
 
 start_link() ->
+    %% 写入自己的pid
     write_pidfile(),
+    %% 启动log信息
     notify_starting(),
 
     case supervisor:start_link({local, ?MODULE}, ?MODULE, []) of

@@ -216,7 +216,7 @@ handle_design_info_req(#httpd{
     couch_mrview_http:handle_info_req(Req, Db, DDoc).
 
 create_db_req(#httpd{user_ctx=UserCtx}=Req, DbName) ->
-    ok = couch_httpd:verify_is_server_admin(Req),
+    ok = couch_httpd:verify_is_server_admin(Req), %% 验证是否是管理员
     case couch_server:create(DbName, [{user_ctx, UserCtx}]) of
     {ok, Db} ->
         couch_db:close(Db),

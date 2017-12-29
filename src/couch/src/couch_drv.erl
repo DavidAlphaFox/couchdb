@@ -24,6 +24,7 @@ start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 init([]) ->
+    %% CouchDB 加载icu驱动
     LibDir = util_driver_dir(),
     case erl_ddll:load(LibDir, "couch_icu_driver") of
     ok ->
