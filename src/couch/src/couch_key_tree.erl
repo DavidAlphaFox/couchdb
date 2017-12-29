@@ -11,7 +11,7 @@
 % the License.
 
 %% @doc Data structure used to represent document edit histories.
-
+%% 键值树代表文档修改历史
 %% A key tree is used to represent the edit history of a document. Each node of
 %% the tree represents a particular version. Relations between nodes represent
 %% the order that these edits were applied. For instance, a set of three edits

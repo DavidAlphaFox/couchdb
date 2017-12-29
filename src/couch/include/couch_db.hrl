@@ -102,13 +102,13 @@
 
 
 -record(doc, {
-    id = <<"">>,
-    revs = {0, []},
+    id = <<"">>, %% ID
+    revs = {0, []}, %% revs是多版本的基础
 
     % the json body object.
-    body = {[]},
+    body = {[]}, %% 数据体
 
-    atts = [] :: [couch_att:att()], % attachments
+    atts = [] :: [couch_att:att()], % attachments 附件
 
     deleted = false,
 

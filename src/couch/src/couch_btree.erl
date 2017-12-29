@@ -243,14 +243,14 @@ query_modify(Bt, LookupKeys, InsertValues, RemoveKeys) ->
         fun(KeyValue) ->
             {Key, Value} = extract(Bt, KeyValue),
             {insert, Key, Value}
-        end, InsertValues),
+        end, InsertValues),%% 生成所有操作{insert, Key, Value}
     RemoveActions = [{remove, Key, nil} || Key <- RemoveKeys],
     FetchActions = [{fetch, Key, nil} || Key <- LookupKeys],
     SortFun =
         fun({OpA, A, _}, {OpB, B, _}) ->
             case A == B of
-            % A and B are equal, sort by op.
-            true -> op_order(OpA) < op_order(OpB);
+            % A and B are equal, sort by op. 先key比较，在op比较
+            true -> op_order(OpA) < op_order(OpB); %% 读取优先级最高
             false ->
                 less(Bt, A, B)
             end
@@ -376,7 +376,7 @@ get_chunk_size() ->
     catch error:badarg ->
         1279
     end.
-
+%% 修改根节点
 modify_node(Bt, RootPointerInfo, Actions, QueryOutput) ->
     case RootPointerInfo of
     nil ->

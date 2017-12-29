@@ -1090,9 +1090,9 @@ update_docs(Db, Docs0, Options, replicated_changes) ->
     {ok, DocErrors};
 
 update_docs(Db, Docs0, Options, interactive_edit) ->
-    increment_stat(Db, [couchdb, database_writes]),
+    increment_stat(Db, [couchdb, database_writes]), %% 增加当前数据库的统计技术
     AllOrNothing = lists:member(all_or_nothing, Options),
-    Docs = tag_docs(Docs0),
+    Docs = tag_docs(Docs0),%% 为文件增加meta的ref
 
     % Separate _local docs from normal docs
     IsLocal = fun

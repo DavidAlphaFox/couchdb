@@ -69,8 +69,8 @@
 
 new() ->
     #db_header{
-        uuid = couch_uuids:random(),
-        epochs = [{node(), 0}]
+        uuid = couch_uuids:random(), %% 唯一id
+        epochs = [{node(), 0}] %% 逻辑时钟
     }.
 
 

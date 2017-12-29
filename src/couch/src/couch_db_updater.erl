@@ -44,7 +44,7 @@ init({DbName, Filepath, Fd, Options}) ->
     true ->
         % create a new header and writes it to the file
         Header =  couch_db_header:new(), %% 创建新的header
-        ok = couch_file:write_header(Fd, Header),
+        ok = couch_file:write_header(Fd, Header), %% 写入header
         % delete any old compaction files that might be hanging around
         RootDir = config:get("couchdb", "database_dir", "."),
         couch_file:delete(RootDir, Filepath ++ ".compact"),
@@ -878,7 +878,7 @@ update_docs_int(Db, DocsList, NonRepDocs, MergeConflicts, FullCommit) ->
         } = Db,
     Ids = [Id || [{_Client, #doc{id=Id}}|_] <- DocsList],
     % lookup up the old documents, if they exist.
-    OldDocLookups = couch_btree:lookup(DocInfoByIdBTree, Ids),
+    OldDocLookups = couch_btree:lookup(DocInfoByIdBTree, Ids), %% 找到老的文档
     OldDocInfos = lists:zipwith(
         fun(_Id, {ok, FullDocInfo}) ->
             FullDocInfo;
@@ -888,7 +888,7 @@ update_docs_int(Db, DocsList, NonRepDocs, MergeConflicts, FullCommit) ->
         Ids, OldDocLookups),
     % Merge the new docs into the revision trees.
     {ok, NewFullDocInfos, RemoveSeqs, NewSeq} = merge_rev_trees(RevsLimit,
-            MergeConflicts, DocsList, OldDocInfos, [], [], LastSeq),
+            MergeConflicts, DocsList, OldDocInfos, [], [], LastSeq), %% 合并文档
 
     % All documents are now ready to write.
 
@@ -896,7 +896,7 @@ update_docs_int(Db, DocsList, NonRepDocs, MergeConflicts, FullCommit) ->
 
     % Write out the document summaries (the bodies are stored in the nodes of
     % the trees, the attachments are already written to disk)
-    {ok, IndexFullDocInfos} = flush_trees(Db2, NewFullDocInfos, []),
+    {ok, IndexFullDocInfos} = flush_trees(Db2, NewFullDocInfos, []),%% 写数据到磁盘
 
     % and the indexes
     {ok, DocInfoByIdBTree2} = couch_btree:add_remove(DocInfoByIdBTree, IndexFullDocInfos, []),

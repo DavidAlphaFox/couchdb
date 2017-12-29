@@ -741,7 +741,7 @@ update_doc_result_to_json(DocId, Error) ->
 
 
 update_doc(Req, Db, DocId, #doc{deleted=false}=Doc) ->
-    DbName = couch_db:name(Db),
+    DbName = couch_db:name(Db), %% 数据库名称
     Loc = absolute_uri(Req, "/" ++ couch_util:url_encode(DbName) ++ "/" ++ couch_util:url_encode(DocId)),
     update_doc(Req, Db, DocId, Doc, [{"Location", Loc}]);
 update_doc(Req, Db, DocId, Doc) ->
