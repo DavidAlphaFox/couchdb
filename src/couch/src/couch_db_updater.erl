@@ -987,7 +987,7 @@ commit_data(Db, _) ->
         waiting_delayed_commit = Timer
     } = Db,
     if is_reference(Timer) -> erlang:cancel_timer(Timer); true -> ok end,
-    case db_to_header(Db, OldHeader) of
+    case db_to_header(Db, OldHeader) of %% 如果header发生了改变，那么同步header到磁盘上
         OldHeader -> Db#db{waiting_delayed_commit=nil};
         NewHeader -> sync_header(Db, NewHeader)
     end.

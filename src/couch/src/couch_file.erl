@@ -487,7 +487,7 @@ handle_call({write_header, Bin}, _From, #file{fd = Fd, eof = Pos} = File) ->
     0 ->
         Padding = <<>>;
     BlockOffset ->
-        Padding = <<0:(8*(?SIZE_BLOCK-BlockOffset))>>
+        Padding = <<0:(8*(?SIZE_BLOCK-BlockOffset))>> %% 全部都填入0
     end,
     FinalBin = [Padding, <<1, BinSize:32/integer>> | make_blocks(5, [Bin])],
     case file:write(Fd, FinalBin) of
