@@ -617,7 +617,7 @@ init_db(DbName, Filepath, Fd, Header0, Options) ->
         id_tree = IdBtree,
         seq_tree = SeqBtree,
         local_tree = LocalDocsBtree,
-        committed_update_seq = couch_db_header:update_seq(Header),
+        committed_update_seq = couch_db_header:update_seq(Header),%% 已经提交的seq
         update_seq = couch_db_header:update_seq(Header),
         name = DbName,
         filepath = Filepath,

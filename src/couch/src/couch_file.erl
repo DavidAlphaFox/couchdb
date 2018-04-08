@@ -171,6 +171,7 @@ pread_binary(Fd, Pos) ->
 
 
 pread_iolist(Fd, Pos) ->
+    %% 使用gen_server来完成数据操作
     case ioq:call(Fd, {pread_iolist, Pos}, erlang:get(io_priority)) of
     {ok, IoList, <<>>} ->
         {ok, IoList};
@@ -436,8 +437,8 @@ handle_call(close, _From, #file{fd=Fd}=File) ->
     {stop, normal, file:close(Fd), File#file{fd = nil}};
 
 handle_call({pread_iolist, Pos}, _From, File) ->
-    update_read_timestamp(),
-    {LenIolist, NextPos} = read_raw_iolist_int(File, Pos, 4),
+    update_read_timestamp(),%% 更新自己读取时间戳
+    {LenIolist, NextPos} = read_raw_iolist_int(File, Pos, 4), %% 整块读取
     case iolist_to_binary(LenIolist) of
     <<1:1/integer,Len:31/integer>> -> % an MD5-prefixed term
         {Md5AndIoList, _} = read_raw_iolist_int(File, NextPos, Len+16),
