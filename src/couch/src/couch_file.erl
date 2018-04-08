@@ -366,7 +366,7 @@ init({Filepath, Options, ReturnPid, Ref}) ->
         {ok, Fd} ->
             %% Save Fd in process dictionary for debugging purposes
             put(couch_file_fd, {Fd, Filepath}),
-            {ok, Length} = file:position(Fd, eof),
+            {ok, Length} = file:position(Fd, eof),%% 打开成功后直接通过设置文件指针到最后来获取长度
             case Length > 0 of
             true ->
                 % this means the file already exists and has data.
@@ -401,7 +401,7 @@ init({Filepath, Options, ReturnPid, Ref}) ->
             put(couch_file_fd, {Fd, Filepath}),
             ok = file:close(Fd_Read),
             maybe_track_open_os_files(Options),
-            {ok, Eof} = file:position(Fd, eof),
+            {ok, Eof} = file:position(Fd, eof),%% 默认直接寻址到结尾
             erlang:send_after(?INITIAL_WAIT, self(), maybe_close),
             {ok, #file{fd=Fd, eof=Eof, is_sys=IsSys, pread_limit=Limit}};
         Error ->
@@ -525,7 +525,7 @@ handle_info({'DOWN', Ref, process, _Pid, _Info}, #file{db_monitor=Ref}=File) ->
         false -> {noreply, File}
     end.
 
-
+%% 从最后一个文件块向前寻找有效的header
 find_header(Fd, Block) ->
     case (catch load_header(Fd, Block)) of
     {ok, Bin} ->
@@ -543,9 +543,9 @@ load_header(Fd, Block) ->
 
 load_header(Fd, Pos, HeaderLen) ->
     load_header(Fd, Pos, HeaderLen, <<>>).
-
+%% 发现有效的header
 load_header(Fd, Pos, HeaderLen, RestBlock) ->
-    TotalBytes = calculate_total_read_len(?PREFIX_SIZE, HeaderLen),
+    TotalBytes = calculate_total_read_len(?PREFIX_SIZE, HeaderLen),%% 计算总字节
     RawBin = case TotalBytes =< byte_size(RestBlock) of
         true ->
             <<RawBin0:TotalBytes/binary, _/binary>> = RestBlock,
@@ -557,7 +557,7 @@ load_header(Fd, Pos, HeaderLen, RestBlock) ->
             <<RestBlock/binary, Missing/binary>>
     end,
     <<Md5Sig:16/binary, HeaderBin/binary>> =
-        iolist_to_binary(remove_block_prefixes(?PREFIX_SIZE, RawBin)),
+        iolist_to_binary(remove_block_prefixes(?PREFIX_SIZE, RawBin)), %% 验证是一个有效的header
     Md5Sig = crypto:hash(md5, HeaderBin),
     {ok, HeaderBin}.
 
