@@ -11,7 +11,7 @@
 // the License.
  
  
- 
+couchTests.elixir = true;
 couchTests.rewrite = function(debug) {
   if (debug) debugger;
   var dbNames = [get_random_db_name(), get_random_db_name() + "test_suite_db/with_slashes"];
@@ -100,9 +100,12 @@ couchTests.rewrite = function(debug) {
             return {path: '_list/simpleForm/complexView2',
                     query: {key: JSON.stringify({"c": 1})}};
         }
-        if (req.path.slice(4).join('/') === 'simpleForm/complexView4') {
-            return {path: '_list/simpleForm/complexView2',
-                    query: {key: JSON.stringify({"c": 1})}};
+        if (req.path.slice(4).join('/') === 'simpleForm/sendBody1') {
+            return {path:   '_list/simpleForm/complexView2',
+                    method: 'POST',
+                    query:  {limit: '1'},
+                    headers:{'Content-type':'application/json'},
+                    body:  JSON.stringify( {keys: [{"c": 1}]} )};
         }
         if (req.path.slice(4).join('/') === '/') {
             return {path: '_view/basicView'};
@@ -113,7 +116,6 @@ couchTests.rewrite = function(debug) {
       }),
       lists: {
         simpleForm: stringFun(function(head, req) {
-          log("simpleForm");
           send('<ul>');
           var row, row_number = 0, prevKey, firstKey = null;
           while (row = getRow()) {
@@ -283,6 +285,11 @@ couchTests.rewrite = function(debug) {
     T(xhr.status == 200, "with query params");
     T(/Value: doc 5/.test(xhr.responseText));
 
+    // COUCHDB-1612 - send body rewriting get to post
+    xhr = CouchDB.request("GET", "/"+dbName+"/_design/test/_rewrite/simpleForm/sendBody1");
+    T(xhr.status == 200, "get->post rewrite failed:\n"+xhr.responseText);
+    T(/Value: doc 5 LineNo: 1/.test(xhr.responseText), "get->post rewrite responded wrong:\n"+xhr.responseText);
+
     // COUCHDB-2031 - path normalization versus qs params
     xhr = CouchDB.request("GET", "/"+dbName+"/_design/test/_rewrite/db/_design/test?meta=true");
     T(xhr.status == 200, "path normalization works with qs params");
@@ -337,6 +344,22 @@ couchTests.rewrite = function(debug) {
     var xhr = CouchDB.request("GET", url);
     TEquals(400, xhr.status);
 
+    // test requests with body preserve the query string rewrite
+    var ddoc_qs = {
+      "_id": "_design/qs", 
+      "rewrites": "function (r) { return {path: '../../_changes', query: {'filter': '_doc_ids'}};};"
+    }
+    db.save(ddoc_qs);
+    db.save({"_id": "qs1", "foo": "bar"});
+    db.save({"_id": "qs2", "foo": "bar"});
+
+    var url = "/"+dbName+"/_design/qs/_rewrite";
+
+    var xhr = CouchDB.request("POST", url, {body: JSON.stringify({"doc_ids": ["qs2"]})});
+    var result = JSON.parse(xhr.responseText);
+    T(xhr.status == 200);
+    T(result.results.length == 1, "Only one doc is expected");
+    TEquals(result.results[0].id, "qs2");
     // cleanup
     db.deleteDb();
   }

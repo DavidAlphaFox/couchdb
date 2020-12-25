@@ -34,6 +34,11 @@ authorize_request_int(#httpd{path_parts=[]}=Req) ->
 authorize_request_int(#httpd{path_parts=[<<"favicon.ico">>|_]}=Req) ->
     Req;
 authorize_request_int(#httpd{path_parts=[<<"_all_dbs">>|_]}=Req) ->
+   case config:get_boolean("chttpd", "admin_only_all_dbs", true) of
+       true -> require_admin(Req);
+       false -> Req
+   end;
+authorize_request_int(#httpd{path_parts=[<<"_dbs_info">>|_]}=Req) ->
     Req;
 authorize_request_int(#httpd{path_parts=[<<"_replicator">>], method='PUT'}=Req) ->
     require_admin(Req);
@@ -45,6 +50,8 @@ authorize_request_int(#httpd{path_parts=[<<"_replicator">>,<<"_changes">>|_]}=Re
     require_admin(Req);
 authorize_request_int(#httpd{path_parts=[<<"_replicator">>|_]}=Req) ->
     db_authorization_check(Req);
+authorize_request_int(#httpd{path_parts=[<<"_reshard">>|_]}=Req) ->
+    require_admin(Req);
 authorize_request_int(#httpd{path_parts=[<<"_users">>], method='PUT'}=Req) ->
     require_admin(Req);
 authorize_request_int(#httpd{path_parts=[<<"_users">>], method='DELETE'}=Req) ->
@@ -65,6 +72,12 @@ authorize_request_int(#httpd{path_parts=[_DbName, <<"_compact">>|_]}=Req) ->
     require_db_admin(Req);
 authorize_request_int(#httpd{path_parts=[_DbName, <<"_view_cleanup">>]}=Req) ->
     require_db_admin(Req);
+authorize_request_int(#httpd{path_parts=[_DbName, <<"_sync_shards">>]}=Req) ->
+    require_admin(Req);
+authorize_request_int(#httpd{path_parts=[_DbName, <<"_purge">>]}=Req) ->
+    require_admin(Req);
+authorize_request_int(#httpd{path_parts=[_DbName, <<"_purged_infos_limit">>]}=Req) ->
+    require_admin(Req);
 authorize_request_int(#httpd{path_parts=[_DbName|_]}=Req) ->
     db_authorization_check(Req).
 
@@ -81,23 +94,39 @@ server_authorization_check(#httpd{path_parts=[<<"_stats">>]}=Req) ->
     Req;
 server_authorization_check(#httpd{path_parts=[<<"_active_tasks">>]}=Req) ->
     Req;
+server_authorization_check(#httpd{path_parts=[<<"_dbs_info">>]}=Req) ->
+    Req;
 server_authorization_check(#httpd{method=Method, path_parts=[<<"_utils">>|_]}=Req)
   when Method =:= 'HEAD' orelse Method =:= 'GET' ->
     Req;
+server_authorization_check(#httpd{path_parts=[<<"_node">>,_ , <<"_stats">>|_]}=Req) ->
+    require_metrics(Req);
+server_authorization_check(#httpd{path_parts=[<<"_node">>,_ , <<"_system">>|_]}=Req) ->
+    require_metrics(Req);
 server_authorization_check(#httpd{path_parts=[<<"_", _/binary>>|_]}=Req) ->
     require_admin(Req).
 
-db_authorization_check(#httpd{path_parts=[DbName|_],user_ctx=Ctx}=Req) ->
-    {_} = fabric:get_security(DbName, [{user_ctx, Ctx}]),
+db_authorization_check(#httpd{path_parts=[_DbName|_]}=Req) ->
+    % Db authorization checks are performed in fabric before every FDB operation
     Req.
+
+
+require_metrics(#httpd{user_ctx=#user_ctx{roles=UserRoles}}=Req) ->
+    IsAdmin = lists:member(<<"_admin">>, UserRoles),
+    IsMetrics = lists:member(<<"_metrics">>, UserRoles),
+    case {IsAdmin, IsMetrics} of
+        {true, _} -> Req;
+        {_, true} -> Req;
+        _ -> throw({unauthorized, <<"You are not a server admin or read-only metrics user">>})
+    end.
 
 require_admin(Req) ->
     ok = couch_httpd:verify_is_server_admin(Req),
     Req.
 
 require_db_admin(#httpd{path_parts=[DbName|_],user_ctx=Ctx}=Req) ->
-    Sec = fabric:get_security(DbName, [{user_ctx, Ctx}]),
-
+    {ok, Db} = fabric2_db:open(DbName, [{user_ctx, Ctx}]),
+    Sec = fabric2_db:get_security(Db),
     case is_db_admin(Ctx,Sec) of
         true -> Req;
         false ->  throw({unauthorized, <<"You are not a server or db admin.">>})

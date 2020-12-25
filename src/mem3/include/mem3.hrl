@@ -10,13 +10,19 @@
 % License for the specific language governing permissions and limitations under
 % the License.
 
+
+% The last element in the ring
+-define(RING_END, 2 bsl 31 - 1).
+
+
 % type specification hacked to suppress dialyzer warning re: match spec
 -record(shard, {
-    name :: binary() | '_',
-    node :: node() | '_',
-    dbname :: binary(),
-    range :: [non_neg_integer() | '$1' | '$2'] | '_',
-    ref :: reference() | 'undefined' | '_'
+    name :: binary() | '_' | 'undefined',
+    node :: node() | '_' | 'undefined',
+    dbname :: binary() | 'undefined',
+    range :: [non_neg_integer() | '$1' | '$2'] | '_' | 'undefined',
+    ref :: reference() | '_' | 'undefined',
+    opts :: list() | 'undefined'
 }).
 
 %% Do not reference outside of mem3.
@@ -26,7 +32,8 @@
     dbname :: binary(),
     range :: [non_neg_integer() | '$1' | '$2'] | '_',
     ref :: reference() | 'undefined' | '_',
-    order :: non_neg_integer() | 'undefined' | '_'
+    order :: non_neg_integer() | 'undefined' | '_',
+    opts :: list()
 }).
 
 %% types

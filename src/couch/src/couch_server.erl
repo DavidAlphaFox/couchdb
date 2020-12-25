@@ -15,13 +15,18 @@
 -behaviour(config_listener).
 -vsn(3).
 
--export([open/2,create/2,delete/2,get_version/0,get_version/1,get_uuid/0]).
+-export([open/2,create/2,delete/2,get_version/0,get_version/1,get_git_sha/0,get_uuid/0]).
 -export([all_databases/0, all_databases/2]).
 -export([init/1, handle_call/3,sup_start_link/0]).
--export([handle_cast/2,code_change/3,handle_info/2,terminate/2]).
+-export([handle_cast/2,code_change/3,handle_info/2,terminate/2,format_status/2]).
 -export([dev_start/0,is_admin/2,has_admins/0,get_stats/0]).
 -export([close_lru/0]).
 -export([close_db_if_idle/1]).
+-export([delete_compaction_files/1]).
+-export([exists/1]).
+-export([get_engine_extensions/0]).
+-export([get_engine_path/2]).
+-export([lock/2, unlock/1]).
 
 % config_listener api
 -export([handle_config_change/5, handle_config_terminate/3]).
@@ -34,6 +39,7 @@
 
 -record(server,{
     root_dir = [],
+    engines = [],
     max_dbs_open=?MAX_DBS_OPEN,
     dbs_open=0,
     start_time="",
@@ -53,6 +59,7 @@ get_version(short) ->
   [Version|_Rest] = string:tokens(get_version(), "+"),
   Version.
 
+get_git_sha() -> ?COUCHDB_GIT_SHA.
 
 get_uuid() ->
     case config:get("couchdb", "uuid", undefined) of
@@ -71,8 +78,15 @@ get_stats() ->
 sup_start_link() ->
     gen_server:start_link({local, couch_server}, couch_server, [], []).
 
+open(DbName, Options) ->
+    try
+        validate_open_or_create(DbName, Options),
+        open_int(DbName, Options)
+    catch throw:{?MODULE, Error} ->
+        Error
+    end.
 
-open(DbName, Options0) ->
+open_int(DbName, Options0) ->
     Ctx = couch_util:get_value(user_ctx, Options0, #user_ctx{}),
     case ets:lookup(couch_dbs, DbName) of
     [#entry{db = Db0, lock = Lock} = Entry] when Lock =/= locked ->
@@ -96,16 +110,30 @@ open(DbName, Options0) ->
     end.
 
 update_lru(DbName, Options) ->
-    case lists:member(sys_db, Options) of
-        false -> gen_server:cast(couch_server, {update_lru, DbName});
-        true -> ok
+    case config:get_boolean("couchdb", "update_lru_on_read", false) of
+        true ->
+            case lists:member(sys_db, Options) of
+                false -> gen_server:cast(couch_server, {update_lru, DbName});
+                true -> ok
+            end;
+        false ->
+            ok
     end.
 
 close_lru() ->
     gen_server:call(couch_server, close_lru).
 
-create(DbName, Options0) ->
+create(DbName, Options) ->
+    try
+        validate_open_or_create(DbName, Options),
+        create_int(DbName, Options)
+    catch throw:{?MODULE, Error} ->
+        Error
+    end.
+
+create_int(DbName, Options0) ->
     Options = maybe_add_sys_db_callbacks(DbName, Options0),
+    couch_partition:validate_dbname(DbName, Options),
     case gen_server:call(couch_server, {create, DbName, Options}, infinity) of
     {ok, Db0} ->
         Ctx = couch_util:get_value(user_ctx, Options, #user_ctx{}),
@@ -118,6 +146,27 @@ create(DbName, Options0) ->
 delete(DbName, Options) ->
     gen_server:call(couch_server, {delete, DbName, Options}, infinity).
 
+
+exists(DbName) ->
+    RootDir = config:get("couchdb", "database_dir", "."),
+    Engines = get_configured_engines(),
+    Possible = get_possible_engines(DbName, RootDir, Engines),
+    Possible /= [].
+
+
+delete_compaction_files(DbName) ->
+    delete_compaction_files(DbName, []).
+
+delete_compaction_files(DbName, DelOpts) when is_list(DbName) ->
+    RootDir = config:get("couchdb", "database_dir", "."),
+    lists:foreach(fun({Ext, Engine}) ->
+        FPath = make_filepath(RootDir, DbName, Ext),
+        couch_db_engine:delete_compaction_files(Engine, RootDir, FPath, DelOpts)
+    end, get_configured_engines()),
+    ok;
+delete_compaction_files(DbName, DelOpts) when is_binary(DbName) ->
+    delete_compaction_files(?b2l(DbName), DelOpts).
+
 maybe_add_sys_db_callbacks(DbName, Options) when is_binary(DbName) ->
     maybe_add_sys_db_callbacks(?b2l(DbName), Options);
 maybe_add_sys_db_callbacks(DbName, Options) ->
@@ -129,20 +178,20 @@ maybe_add_sys_db_callbacks(DbName, Options) ->
     IsUsersDb = path_ends_with(DbName, "_users")
         orelse path_ends_with(DbName, UsersDbSuffix),
     if
-	DbName == DbsDbName ->
-	    [sys_db | Options];
-	DbName == NodesDbName ->
-	    [sys_db | Options];
-	IsReplicatorDb ->
-	    [{before_doc_update, fun couch_replicator_manager:before_doc_update/2},
-	     {after_doc_read, fun couch_replicator_manager:after_doc_read/2},
-	     sys_db | Options];
-	IsUsersDb ->
-	    [{before_doc_update, fun couch_users_db:before_doc_update/2},
-	     {after_doc_read, fun couch_users_db:after_doc_read/2},
-	     sys_db | Options];
-	true ->
-	    Options
+        DbName == DbsDbName ->
+            [sys_db | Options];
+        DbName == NodesDbName ->
+            [sys_db | Options];
+        IsReplicatorDb ->
+            [{before_doc_update, fun couch_replicator_docs:before_doc_update/3},
+             {after_doc_read, fun couch_replicator_docs:after_doc_read/2},
+             sys_db | Options];
+        IsUsersDb ->
+            [{before_doc_update, fun couch_users_db:before_doc_update/3},
+             {after_doc_read, fun couch_users_db:after_doc_read/2},
+             sys_db | Options];
+        true ->
+            Options
     end.
 
 path_ends_with(Path, Suffix) when is_binary(Suffix) ->
@@ -150,7 +199,7 @@ path_ends_with(Path, Suffix) when is_binary(Suffix) ->
 path_ends_with(Path, Suffix) when is_list(Suffix) ->
     path_ends_with(Path, ?l2b(Suffix)).
 
-check_dbname(#server{}, DbName) ->
+check_dbname(DbName) ->
     couch_db:validate_dbname(DbName).
 
 is_admin(User, ClearPwd) ->
@@ -164,9 +213,6 @@ is_admin(User, ClearPwd) ->
 
 has_admins() ->
     config:get("admins") /= [].
-
-get_full_filename(Server, DbName) ->
-    filename:join([Server#server.root_dir, "./" ++ DbName ++ ".couch"]).
 
 hash_admin_passwords() ->
     hash_admin_passwords(true).
@@ -188,23 +234,53 @@ close_db_if_idle(DbName) ->
 
 %% 主服务器
 init([]) ->
+    couch_util:set_mqd_off_heap(?MODULE),
+    couch_util:set_process_priority(?MODULE, high),
+
+    % Mark being able to receive documents with an _access property as a supported feature
+    config:enable_feature('access-ready'),
+
+    % Mark if fips is enabled
+    case
+        erlang:function_exported(crypto, info_fips, 0) andalso
+          crypto:info_fips() == enabled of
+        true ->
+            config:enable_feature('fips');
+        false ->
+            ok
+    end,
+
     % read config and register for configuration changes
 
     % just stop if one of the config settings change. couch_server_sup
     % will restart us and then we will pick up the new settings.
     %% 获取启动参数，数据库目录，最大打开数据库数量，是否使用LRU
     RootDir = config:get("couchdb", "database_dir", "."),
+    Engines = get_configured_engines(),
     MaxDbsOpen = list_to_integer(
             config:get("couchdb", "max_dbs_open", integer_to_list(?MAX_DBS_OPEN))),
     UpdateLruOnRead =
-        config:get("couchdb", "update_lru_on_read", "true") =:= "true",
+        config:get("couchdb", "update_lru_on_read", "false") =:= "true",
     ok = config:listen_for_changes(?MODULE, nil),
-    ok = couch_file:init_delete_dir(RootDir), %% 删除所有'database_dir'.delete下的文件
-    hash_admin_passwords(), %% 管理员密码
-    ets:new(couch_dbs, [set, protected, named_table, {keypos, #entry.name}]), %% 打开的db列表
-    ets:new(couch_dbs_pid_to_name, [set, protected, named_table]), %% 数据库进程和数据库映射
+    ok = couch_file:init_delete_dir(RootDir),
+    hash_admin_passwords(),
+    ets:new(couch_dbs, [
+        set,
+        protected,
+        named_table,
+        {keypos, #entry.name},
+        {read_concurrency, true}
+    ]),
+    ets:new(couch_dbs_pid_to_name, [set, protected, named_table]),
+    ets:new(couch_dbs_locks, [
+        set,
+        public,
+        named_table,
+        {read_concurrency, true}
+    ]),
     process_flag(trap_exit, true),
     {ok, #server{root_dir=RootDir,
+                engines = Engines,
                 max_dbs_open=MaxDbsOpen,
                 update_lru_on_read=UpdateLruOnRead,
                 start_time=couch_util:rfc1123_date()}}.
@@ -214,9 +290,17 @@ terminate(Reason, Srv) ->
                     [Reason,
                      Srv#server{lru = redacted}]),
     ets:foldl(fun(#entry{db = Db}, _) ->
-        couch_util:shutdown_sync(couch_db:get_pid(Db))
+        % Filter out any entry records for open_async
+        % processes that haven't finished.
+        if Db == undefined -> ok; true ->
+            couch_util:shutdown_sync(couch_db:get_pid(Db))
+        end
     end, nil, couch_dbs),
     ok.
+
+format_status(_Opt, [_PDict, Srv]) ->
+    Scrubbed = Srv#server{lru=couch_lru:sizes(Srv#server.lru)},
+    [{data, [{"State", ?record_to_keyval(server, Scrubbed)}]}].
 
 handle_config_change("couchdb", "database_dir", _, _, _) ->
     exit(whereis(couch_server), config_change),
@@ -229,6 +313,8 @@ handle_config_change("couchdb", "max_dbs_open", Max, _, _) when is_list(Max) ->
     {ok, gen_server:call(couch_server,{set_max_dbs_open,list_to_integer(Max)})};
 handle_config_change("couchdb", "max_dbs_open", _, _, _) ->
     {ok, gen_server:call(couch_server,{set_max_dbs_open,?MAX_DBS_OPEN})};
+handle_config_change("couchdb_engines", _, _, _, _) ->
+    {ok, gen_server:call(couch_server, reload_engines)};
 handle_config_change("admins", _, _, Persist, _) ->
     % spawn here so couch event manager doesn't deadlock
     {ok, spawn(fun() -> hash_admin_passwords(Persist) end)};
@@ -239,12 +325,6 @@ handle_config_change("httpd", "bind_address", _, _, _) ->
 handle_config_change("httpd", "port", _, _, _) ->
     {ok, couch_httpd:stop()};
 handle_config_change("httpd", "max_connections", _, _, _) ->
-    {ok, couch_httpd:stop()};
-handle_config_change("httpd", "default_handler", _, _, _) ->
-    {ok, couch_httpd:stop()};
-handle_config_change("httpd_global_handlers", _, _, _, _) ->
-    {ok, couch_httpd:stop()};
-handle_config_change("httpd_db_handlers", _, _, _, _) ->
     {ok, couch_httpd:stop()};
 handle_config_change(_, _, _, _, _) ->
     {ok, nil}.
@@ -263,11 +343,15 @@ all_databases() ->
 all_databases(Fun, Acc0) ->
     {ok, #server{root_dir=Root}} = gen_server:call(couch_server, get_server),
     NormRoot = couch_util:normpath(Root),
-    FinalAcc = try
-    filelib:fold_files(Root,
+    Extensions = get_engine_extensions(),
+    ExtRegExp = "(" ++ string:join(Extensions, "|") ++ ")",
+    RegExp =
         "^[a-z0-9\\_\\$()\\+\\-]*" % stock CouchDB name regex
         "(\\.[0-9]{10,})?"         % optional shard timestamp
-        "\\.couch$",               % filename extension
+        "\\." ++ ExtRegExp ++ "$", % filename extension
+    FinalAcc = try
+    couch_util:fold_files(Root,
+        RegExp,
         true,
             fun(Filename, AccIn) ->
                 NormFilename = couch_util:normpath(Filename),
@@ -275,7 +359,8 @@ all_databases(Fun, Acc0) ->
                 [$/ | RelativeFilename] -> ok;
                 RelativeFilename -> ok
                 end,
-                case Fun(couch_util:drop_dot_couch_ext(?l2b(RelativeFilename)), AccIn) of
+                Ext = filename:extension(RelativeFilename),
+                case Fun(?l2b(filename:rootname(RelativeFilename, Ext)), AccIn) of
                 {ok, NewAcc} -> NewAcc;
                 {stop, NewAcc} -> throw({stop, Fun, NewAcc})
                 end
@@ -303,19 +388,35 @@ maybe_close_lru_db(#server{lru=Lru}=Server) ->
             {error, all_dbs_active}
     end.
 
-open_async(Server, From, DbName, Filepath, Options) ->
+open_async(Server, From, DbName, Options) ->
+    NoLRUServer = Server#server{
+        lru = redacted
+    },
     Parent = self(),
     T0 = os:timestamp(),
     Opener = spawn_link(fun() ->
-        Res = couch_db:start_link(DbName, Filepath, Options), %% 数据库启动
-        case {Res, lists:member(create, Options)} of
-            {{ok, _Db}, true} ->
+        Res = open_async_int(NoLRUServer, DbName, Options),
+        IsSuccess = case Res of
+            {ok, _} -> true;
+            _ -> false
+        end,
+        case IsSuccess andalso lists:member(create, Options) of
+            true ->
                 couch_event:notify(DbName, created);
-            _ ->
+            false ->
                 ok
         end,
-        gen_server:call(Parent, {open_result, T0, DbName, Res}, infinity), %% 报告打开结果
-        unlink(Parent) %% 减少不必要的事件
+        gen_server:call(Parent, {open_result, DbName, Res}, infinity),
+        unlink(Parent),
+        case IsSuccess of
+            true ->
+                % Track latency times for successful opens
+                Diff = timer:now_diff(os:timestamp(), T0) / 1000,
+                couch_stats:update_histogram([couchdb, db_open_time], Diff);
+            false ->
+                % Log unsuccessful open results
+                couch_log:info("open_result error ~p for ~s", [Res, DbName])
+        end
     end),
     ReqType = case lists:member(create, Options) of
         true -> create;
@@ -332,6 +433,20 @@ open_async(Server, From, DbName, Filepath, Options) ->
     true = ets:insert(couch_dbs_pid_to_name, {Opener, DbName}),
     db_opened(Server, Options).
 
+open_async_int(Server, DbName, Options) ->
+    DbNameList = binary_to_list(DbName),
+    case check_dbname(DbNameList) of
+        ok ->
+            case get_engine(Server, DbNameList, Options) of
+                {ok, {Module, FilePath}} ->
+                    couch_db:start_link(Module, DbName, FilePath, Options);
+                Error2 ->
+                    Error2
+            end;
+        Error1 ->
+            Error1
+    end.
+
 handle_call(close_lru, _From, #server{lru=Lru} = Server) ->
     case couch_lru:close(Lru) of
         {true, NewLru} ->
@@ -345,24 +460,24 @@ handle_call({set_update_lru_on_read, UpdateOnRead}, _From, Server) ->
     {reply, ok, Server#server{update_lru_on_read=UpdateOnRead}};
 handle_call({set_max_dbs_open, Max}, _From, Server) ->
     {reply, ok, Server#server{max_dbs_open=Max}};
+handle_call(reload_engines, _From, Server) ->
+    {reply, ok, Server#server{engines = get_configured_engines()}};
 handle_call(get_server, _From, Server) ->
     {reply, {ok, Server}, Server};
-handle_call({open_result, T0, DbName, {ok, Db}}, {FromPid, _Tag}, Server) ->
-    true = ets:delete(couch_dbs_pid_to_name, FromPid), %% 删掉打开进程
-    OpenTime = timer:now_diff(os:timestamp(), T0) / 1000, %%  打开时间戳
-    couch_stats:update_histogram([couchdb, db_open_time], OpenTime), %% 更新统计数据
-    DbPid = couch_db:get_pid(Db),%% 得到DB进程Pid
-    case ets:lookup(couch_dbs, DbName) of 
-        [] ->  %% 查不到，那么就关闭DB进程
+handle_call({open_result, DbName, {ok, Db}}, {Opener, _}, Server) ->
+    true = ets:delete(couch_dbs_pid_to_name, Opener),
+    DbPid = couch_db:get_pid(Db),
+    case ets:lookup(couch_dbs, DbName) of
+        [] ->
             % db was deleted during async open
             exit(DbPid, kill),
             {reply, ok, Server};
-        [#entry{req_type = ReqType, waiters = Waiters} = Entry] ->
-            link(DbPid), %% 关联DB进程，回复请求者
+        [#entry{pid = Opener, req_type = ReqType, waiters = Waiters} = Entry] ->
+            link(DbPid),
             [gen_server:reply(Waiter, {ok, Db}) || Waiter <- Waiters],
             % Cancel the creation request if it exists.
-            case ReqType of %% 通知第二个创建者进程，取消创建
-                {create, DbName, _Filepath, _Options, CrFrom} ->
+            case ReqType of
+                {create, DbName, _Options, CrFrom} ->
                     gen_server:reply(CrFrom, file_exists);
                 _ ->
                     ok
@@ -382,47 +497,50 @@ handle_call({open_result, T0, DbName, {ok, Db}}, {FromPid, _Tag}, Server) ->
                 true ->
                     Server#server.lru
             end,
-            {reply, ok, Server#server{lru = Lru}}
+            {reply, ok, Server#server{lru = Lru}};
+        [#entry{}] ->
+            % A mismatched opener pid means that this open_result message
+            % was in our mailbox but is now stale. Mostly ignore
+            % it except to ensure that the db pid is super dead.
+            exit(couch_db:get_pid(Db), kill),
+            {reply, ok, Server}
     end;
-handle_call({open_result, T0, DbName, {error, eexist}}, From, Server) ->
-    handle_call({open_result, T0, DbName, file_exists}, From, Server);
-handle_call({open_result, _T0, DbName, Error}, {FromPid, _Tag}, Server) ->
+handle_call({open_result, DbName, {error, eexist}}, From, Server) ->
+    handle_call({open_result, DbName, file_exists}, From, Server);
+handle_call({open_result, DbName, Error}, {Opener, _}, Server) ->
     case ets:lookup(couch_dbs, DbName) of
         [] ->
             % db was deleted during async open
             {reply, ok, Server};
-        [#entry{req_type = ReqType, waiters = Waiters} = Entry] ->
+        [#entry{pid = Opener, req_type = ReqType, waiters = Waiters} = Entry] ->
             [gen_server:reply(Waiter, Error) || Waiter <- Waiters],
-            couch_log:info("open_result error ~p for ~s", [Error, DbName]),
             true = ets:delete(couch_dbs, DbName),
-            true = ets:delete(couch_dbs_pid_to_name, FromPid),
+            true = ets:delete(couch_dbs_pid_to_name, Opener),
             NewServer = case ReqType of
-                {create, DbName, Filepath, Options, CrFrom} ->
-                    open_async(Server, CrFrom, DbName, Filepath, Options);
+                {create, DbName, Options, CrFrom} ->
+                    open_async(Server, CrFrom, DbName, Options);
                 _ ->
                     Server
             end,
-            {reply, ok, db_closed(NewServer, Entry#entry.db_options)}
+            {reply, ok, db_closed(NewServer, Entry#entry.db_options)};
+        [#entry{}] ->
+            % A mismatched pid means that this open_result message
+            % was in our mailbox and is now stale. Ignore it.
+            {reply, ok, Server}
     end;
 handle_call({open, DbName, Options}, From, Server) ->
     case ets:lookup(couch_dbs, DbName) of
     [] ->
-        DbNameList = binary_to_list(DbName),
-        case check_dbname(Server, DbNameList) of
-        ok ->
-            case make_room(Server, Options) of
-            {ok, Server2} ->
-                Filepath = get_full_filename(Server, DbNameList),
-                {noreply, open_async(Server2, From, DbName, Filepath, Options)};
-            CloseError ->
-                {reply, CloseError, Server}
-            end;
-        Error ->
-            {reply, Error, Server}
+        case make_room(Server, Options) of
+        {ok, Server2} ->
+            {noreply, open_async(Server2, From, DbName, Options)};
+        CloseError ->
+            {reply, CloseError, Server}
         end;
     [#entry{waiters = Waiters} = Entry] when is_list(Waiters) ->
         true = ets:insert(couch_dbs, Entry#entry{waiters = [From | Waiters]}),
-        if length(Waiters) =< 10 -> ok; true ->
+        NumWaiters = length(Waiters),
+        if NumWaiters =< 10 orelse NumWaiters rem 10 /= 0 -> ok; true ->
             Fmt = "~b clients waiting to open db ~s",
             couch_log:info(Fmt, [length(Waiters), DbName])
         end,
@@ -431,38 +549,30 @@ handle_call({open, DbName, Options}, From, Server) ->
         {reply, {ok, Db}, Server}
     end;
 handle_call({create, DbName, Options}, From, Server) ->
-    DbNameList = binary_to_list(DbName),
-    Filepath = get_full_filename(Server, DbNameList), %% 得到db文件名称
-    case check_dbname(Server, DbNameList) of
-    ok -> %% 名字是符合规则的
-        case ets:lookup(couch_dbs, DbName) of
-        [] ->
-            case make_room(Server, Options) of
-            {ok, Server2} -> %% 从LRU中获取空位置
-                {noreply, open_async(Server2, From, DbName, Filepath,
-                        [create | Options])};
-            CloseError ->
-                {reply, CloseError, Server}
-            end;
-        [#entry{req_type = open} = Entry] ->
-            % We're trying to create a database while someone is in
-            % the middle of trying to open it. We allow one creator
-            % to wait while we figure out if it'll succeed.
+    case ets:lookup(couch_dbs, DbName) of
+    [] ->
+        case make_room(Server, Options) of
+        {ok, Server2} ->
             CrOptions = [create | Options],
-            Req = {create, DbName, Filepath, CrOptions, From},
-            true = ets:insert(couch_dbs, Entry#entry{req_type = Req}),
-            {noreply, Server};
-        [_AlreadyRunningDb] ->
-            {reply, file_exists, Server}
+            {noreply, open_async(Server2, From, DbName, CrOptions)};
+        CloseError ->
+            {reply, CloseError, Server}
         end;
-    Error ->
-        {reply, Error, Server}
+    [#entry{req_type = open} = Entry] ->
+        % We're trying to create a database while someone is in
+        % the middle of trying to open it. We allow one creator
+        % to wait while we figure out if it'll succeed.
+        CrOptions = [create | Options],
+        Req = {create, DbName, CrOptions, From},
+        true = ets:insert(couch_dbs, Entry#entry{req_type = Req}),
+        {noreply, Server};
+    [_AlreadyRunningDb] ->
+        {reply, file_exists, Server}
     end;
 handle_call({delete, DbName, Options}, _From, Server) ->
     DbNameList = binary_to_list(DbName),
-    case check_dbname(Server, DbNameList) of
+    case check_dbname(DbNameList) of
     ok ->
-        FullFilepath = get_full_filename(Server, DbNameList),
         Server2 =
         case ets:lookup(couch_dbs, DbName) of
         [] -> Server;
@@ -479,18 +589,16 @@ handle_call({delete, DbName, Options}, _From, Server) ->
             db_closed(Server, Entry#entry.db_options)
         end,
 
-        %% Delete any leftover compaction files. If we don't do this a
-        %% subsequent request for this DB will try to open them to use
-        %% as a recovery.
-        lists:foreach(fun(Ext) ->
-            couch_file:delete(Server#server.root_dir, FullFilepath ++ Ext)
-        end, [".compact", ".compact.data", ".compact.meta"]),
-        couch_file:delete(Server#server.root_dir, FullFilepath ++ ".compact"),
-
         couch_db_plugin:on_delete(DbName, Options),
 
         DelOpt = [{context, delete} | Options],
-        case couch_file:delete(Server#server.root_dir, FullFilepath, DelOpt) of
+
+        % Make sure and remove all compaction data
+        delete_compaction_files(DbNameList, Options),
+
+        {ok, {Engine, FilePath}} = get_engine(Server, DbNameList),
+        RootDir = Server#server.root_dir,
+        case couch_db_engine:delete(Engine, RootDir, FilePath, DelOpt) of
         ok ->
             couch_event:notify(DbName, deleted),
             {reply, ok, Server2};
@@ -561,7 +669,12 @@ handle_info({'EXIT', Pid, Reason}, Server) ->
                 "must be built with Erlang OTP R13B04 or higher.", [DbName]),
             couch_log:error(Msg, [])
         end,
-        couch_log:info("db ~s died with reason ~p", [DbName, Reason]),
+        % We kill databases on purpose so there's no reason
+        % to log that fact. So we restrict logging to "interesting"
+        % reasons.
+        if Reason == normal orelse Reason == killed -> ok; true ->
+            couch_log:info("db ~s died with reason ~p", [DbName, Reason])
+        end,
         if not is_list(Waiters) -> ok; true ->
             [gen_server:reply(Waiter, Reason) || Waiter <- Waiters]
         end,
@@ -589,22 +702,202 @@ db_closed(Server, Options) ->
         true -> Server
     end.
 
+validate_open_or_create(DbName, Options) ->
+    case check_dbname(DbName) of
+        ok ->
+            ok;
+        DbNameError ->
+            throw({?MODULE, DbNameError})
+    end,
+
+    case check_engine(Options) of
+        ok ->
+            ok;
+        EngineError ->
+            throw({?MODULE, EngineError})
+    end,
+
+    case ets:lookup(couch_dbs_locks, DbName) of
+        [] ->
+            ok;
+        [{DbName, Reason}] ->
+            throw({?MODULE, {error, {locked, Reason}}})
+    end.
+
+get_configured_engines() ->
+    ConfigEntries = config:get("couchdb_engines"),
+    Engines = lists:flatmap(fun({Extension, ModuleStr}) ->
+        try
+            [{Extension, list_to_atom(ModuleStr)}]
+        catch _T:_R ->
+            []
+        end
+    end, ConfigEntries),
+    case Engines of
+        [] ->
+            [{"couch", couch_bt_engine}];
+        Else ->
+            Else
+    end.
+
+
+get_engine(Server, DbName, Options) ->
+    #server{
+        root_dir = RootDir,
+        engines = Engines
+    } = Server,
+    case couch_util:get_value(engine, Options) of
+        Ext when is_binary(Ext) ->
+            ExtStr = binary_to_list(Ext),
+            case lists:keyfind(ExtStr, 1, Engines) of
+                {ExtStr, Engine} ->
+                    Path = make_filepath(RootDir, DbName, ExtStr),
+                    {ok, {Engine, Path}};
+                false ->
+                    {error, {invalid_engine_extension, Ext}}
+            end;
+        _ ->
+            get_engine(Server, DbName)
+    end.
+
+
+get_engine(Server, DbName) ->
+    #server{
+        root_dir = RootDir,
+        engines = Engines
+    } = Server,
+    Possible = get_possible_engines(DbName, RootDir, Engines),
+    case Possible of
+        [] ->
+            get_default_engine(Server, DbName);
+        [Engine] ->
+            {ok, Engine};
+        _ ->
+            erlang:error(engine_conflict)
+    end.
+
+
+get_possible_engines(DbName, RootDir, Engines) ->
+    lists:foldl(fun({Extension, Engine}, Acc) ->
+        Path = make_filepath(RootDir, DbName, Extension),
+        case couch_db_engine:exists(Engine, Path) of
+            true ->
+                [{Engine, Path} | Acc];
+            false ->
+                Acc
+        end
+    end, [], Engines).
+
+
+get_default_engine(Server, DbName) ->
+    #server{
+        root_dir = RootDir,
+        engines = Engines
+    } = Server,
+    Default = {couch_bt_engine, make_filepath(RootDir, DbName, "couch")},
+    case config:get("couchdb", "default_engine") of
+        Extension when is_list(Extension) ->
+            case lists:keyfind(Extension, 1, Engines) of
+                {Extension, Module} ->
+                    {ok, {Module, make_filepath(RootDir, DbName, Extension)}};
+                false ->
+                    Fmt = "Invalid storage engine extension ~s,"
+                            " configured engine extensions are: ~s",
+                    Exts = [E || {E, _} <- Engines],
+                    Args = [Extension, string:join(Exts, ", ")],
+                    couch_log:error(Fmt, Args),
+                    {ok, Default}
+            end;
+        _ ->
+            {ok, Default}
+    end.
+
+
+make_filepath(RootDir, DbName, Extension) when is_binary(RootDir) ->
+    make_filepath(binary_to_list(RootDir), DbName, Extension);
+make_filepath(RootDir, DbName, Extension) when is_binary(DbName) ->
+    make_filepath(RootDir, binary_to_list(DbName), Extension);
+make_filepath(RootDir, DbName, Extension) when is_binary(Extension) ->
+    make_filepath(RootDir, DbName, binary_to_list(Extension));
+make_filepath(RootDir, DbName, Extension) ->
+    filename:join([RootDir, "./" ++ DbName ++ "." ++ Extension]).
+
+
+get_engine_extensions() ->
+    case config:get("couchdb_engines") of
+        [] ->
+            ["couch"];
+        Entries ->
+            [Ext || {Ext, _Mod} <- Entries]
+    end.
+
+
+check_engine(Options) ->
+    case couch_util:get_value(engine, Options) of
+        Ext when is_binary(Ext) ->
+            ExtStr = binary_to_list(Ext),
+            Extensions = get_engine_extensions(),
+            case lists:member(ExtStr, Extensions) of
+                true ->
+                    ok;
+                false ->
+                    {error, {invalid_engine_extension, Ext}}
+            end;
+        _ ->
+            ok
+    end.
+
+
+get_engine_path(DbName, Engine) when is_binary(DbName), is_atom(Engine) ->
+    RootDir = config:get("couchdb", "database_dir", "."),
+    case lists:keyfind(Engine, 2, get_configured_engines()) of
+        {Ext, Engine} ->
+            {ok, make_filepath(RootDir, DbName, Ext)};
+        false ->
+            {error, {invalid_engine, Engine}}
+    end.
+
+lock(DbName, Reason) when is_binary(DbName), is_binary(Reason) ->
+    case ets:lookup(couch_dbs, DbName) of
+        [] ->
+            true = ets:insert(couch_dbs_locks, {DbName, Reason}),
+            ok;
+        [#entry{}] ->
+            {error, already_opened}
+    end.
+
+unlock(DbName) when is_binary(DbName) ->
+    true = ets:delete(couch_dbs_locks, DbName),
+    ok.
+
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
-setup() ->
+setup_all() ->
     ok = meck:new(config, [passthrough]),
     ok = meck:expect(config, get, fun config_get/3),
     ok.
 
-teardown(_) ->
-    (catch meck:unload(config)).
+teardown_all(_) ->
+    meck:unload().
 
 config_get("couchdb", "users_db_suffix", _) -> "users_db";
 config_get(_, _, _) -> undefined.
 
 maybe_add_sys_db_callbacks_pass_test_() ->
-    SysDbCases = [
+    {
+        setup,
+        fun setup_all/0,
+        fun teardown_all/1,
+        [
+            fun should_add_sys_db_callbacks/0,
+            fun should_not_add_sys_db_callbacks/0
+        ]
+    }.
+
+should_add_sys_db_callbacks() ->
+    Cases = [
         "shards/00000000-3fffffff/foo/users_db.1415960794.couch",
         "shards/00000000-3fffffff/foo/users_db.1415960794",
         "shards/00000000-3fffffff/foo/users_db",
@@ -633,8 +926,13 @@ maybe_add_sys_db_callbacks_pass_test_() ->
         "_replicator.couch",
         "_replicator"
     ],
+    lists:foreach(fun(DbName) ->
+        check_case(DbName, true),
+        check_case(?l2b(DbName), true)
+    end, Cases).
 
-    NonSysDbCases = [
+should_not_add_sys_db_callbacks() ->
+    Cases = [
         "shards/00000000-3fffffff/foo/mydb.1415960794.couch",
         "shards/00000000-3fffffff/foo/mydb.1415960794",
         "shards/00000000-3fffffff/mydb",
@@ -643,34 +941,13 @@ maybe_add_sys_db_callbacks_pass_test_() ->
         "mydb.couch",
         "mydb"
     ],
-    {
-        foreach, fun setup/0, fun teardown/1,
-        [
-            [should_add_sys_db_callbacks(C) || C <- SysDbCases]
-            ++
-            [should_add_sys_db_callbacks(?l2b(C)) || C <- SysDbCases]
-            ++
-            [should_not_add_sys_db_callbacks(C) || C <- NonSysDbCases]
-            ++
-            [should_not_add_sys_db_callbacks(?l2b(C)) || C <- NonSysDbCases]
-        ]
-    }.
+    lists:foreach(fun(DbName) ->
+        check_case(DbName, false),
+        check_case(?l2b(DbName), false)
+    end, Cases).
 
-should_add_sys_db_callbacks(DbName) ->
-    {test_name(DbName), ?_test(begin
-        Options = maybe_add_sys_db_callbacks(DbName, [other_options]),
-        ?assert(lists:member(sys_db, Options)),
-        ok
-    end)}.
-should_not_add_sys_db_callbacks(DbName) ->
-    {test_name(DbName), ?_test(begin
-        Options = maybe_add_sys_db_callbacks(DbName, [other_options]),
-        ?assertNot(lists:member(sys_db, Options)),
-        ok
-    end)}.
-
-test_name(DbName) ->
-    lists:flatten(io_lib:format("~p", [DbName])).
-
+check_case(DbName, IsAdded) ->
+    Options = maybe_add_sys_db_callbacks(DbName, [other_options]),
+    ?assertEqual(IsAdded, lists:member(sys_db, Options)).
 
 -endif.

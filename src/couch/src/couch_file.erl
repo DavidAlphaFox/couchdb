@@ -44,10 +44,10 @@
 -export([append_term/2, append_term/3, append_term_md5/2, append_term_md5/3]).
 -export([write_header/2, read_header/1]).
 -export([delete/2, delete/3, nuke_dir/2, init_delete_dir/1]).
--export([msec_since_last_read/1]).
+-export([last_read/1]).
 
 % gen_server callbacks
--export([init/1, terminate/2, code_change/3]).
+-export([init/1, terminate/2, code_change/3, format_status/2]).
 -export([handle_call/3, handle_cast/2, handle_info/2]).
 
 %% helper functions
@@ -132,7 +132,7 @@ append_binary(Fd, Bin) ->
     
 append_binary_md5(Fd, Bin) ->
     ioq:call(Fd,
-        {append_bin, assemble_file_chunk(Bin, crypto:hash(md5, Bin))},
+        {append_bin, assemble_file_chunk(Bin, couch_hash:md5_hash(Bin))},
         erlang:get(io_priority)).
 
 append_raw_chunk(Fd, Chunk) ->
@@ -176,7 +176,7 @@ pread_iolist(Fd, Pos) ->
     {ok, IoList, <<>>} ->
         {ok, IoList};
     {ok, IoList, Md5} ->
-        case crypto:hash(md5, IoList) of
+        case couch_hash:md5_hash(IoList) of
         Md5 ->
             {ok, IoList};
         _ ->
@@ -214,10 +214,28 @@ truncate(Fd, Pos) ->
 %%----------------------------------------------------------------------
 
 sync(Filepath) when is_list(Filepath) ->
-    {ok, Fd} = file:open(Filepath, [append, raw]),
-    try ok = file:sync(Fd) after ok = file:close(Fd) end;
+    case file:open(Filepath, [append, raw]) of
+        {ok, Fd} ->
+            try
+                case file:sync(Fd) of
+                    ok ->
+                        ok;
+                    {error, Reason} ->
+                        erlang:error({fsync_error, Reason})
+                end
+            after
+                ok = file:close(Fd)
+            end;
+        {error, Error} ->
+            erlang:error(Error)
+    end;
 sync(Fd) ->
-    gen_server:call(Fd, sync, infinity).
+    case gen_server:call(Fd, sync, infinity) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            erlang:error({fsync_error, Reason})
+    end.
 
 %%----------------------------------------------------------------------
 %% Purpose: Close the file.
@@ -330,7 +348,7 @@ read_header(Fd) ->
 
 write_header(Fd, Data) ->
     Bin = term_to_binary(Data),
-    Md5 = crypto:hash(md5, Bin),
+    Md5 = couch_hash:md5_hash(Bin),
     % now we assemble the final header binary and write to disk
     FinalBin = <<Md5/binary, Bin/binary>>,
     ioq:call(Fd, {write_header, FinalBin}, erlang:get(io_priority)).
@@ -341,15 +359,9 @@ init_status_error(ReturnPid, Ref, Error) ->
     ignore.
 
 
-% Return time since last read. The return value is conservative in the
-% sense that if no read timestamp has been found, it would return 0. This
-% result is used to decide if reader is idle so returning 0 will avoid marking
-% it idle by accident when process is starting up.
-msec_since_last_read(Fd) when is_pid(Fd) ->
+last_read(Fd) when is_pid(Fd) ->
     Now = os:timestamp(),
-    LastRead = couch_util:process_dict_get(Fd, read_timestamp, Now),
-    DtMSec = timer:now_diff(Now, LastRead) div 1000,
-    max(0, DtMSec).
+    couch_util:process_dict_get(Fd, read_timestamp, Now).
 
 
 % server functions
@@ -396,14 +408,18 @@ init({Filepath, Options, ReturnPid, Ref}) ->
         % open in read mode first, so we don't create the file if it doesn't exist.
         case file:open(Filepath, [read, raw]) of
         {ok, Fd_Read} ->
-            {ok, Fd} = file:open(Filepath, OpenOptions),
-            %% Save Fd in process dictionary for debugging purposes
-            put(couch_file_fd, {Fd, Filepath}),
-            ok = file:close(Fd_Read),
-            maybe_track_open_os_files(Options),
-            {ok, Eof} = file:position(Fd, eof),%% 默认直接寻址到结尾
-            erlang:send_after(?INITIAL_WAIT, self(), maybe_close),
-            {ok, #file{fd=Fd, eof=Eof, is_sys=IsSys, pread_limit=Limit}};
+            case file:open(Filepath, OpenOptions) of
+                {ok, Fd} ->
+                     %% Save Fd in process dictionary for debugging purposes
+                     put(couch_file_fd, {Fd, Filepath}),
+                     ok = file:close(Fd_Read),
+                     maybe_track_open_os_files(Options),
+                     {ok, Eof} = file:position(Fd, eof),
+                     erlang:send_after(?INITIAL_WAIT, self(), maybe_close),
+                     {ok, #file{fd=Fd, eof=Eof, is_sys=IsSys, pread_limit=Limit}};
+                 Error ->
+                     init_status_error(ReturnPid, Ref, Error)
+            end;
         Error ->
             init_status_error(ReturnPid, Ref, Error)
         end
@@ -461,7 +477,16 @@ handle_call({set_db_pid, Pid}, _From, #file{db_monitor=OldRef}=File) ->
     {reply, ok, File#file{db_monitor=Ref}};
 
 handle_call(sync, _From, #file{fd=Fd}=File) ->
-    {reply, file:sync(Fd), File};
+    case file:sync(Fd) of
+        ok ->
+            {reply, ok, File};
+        {error, _} = Error ->
+            % We're intentionally dropping all knowledge
+            % of this Fd so that we don't accidentally
+            % recover in some whacky edge case that I
+            % can't fathom.
+            {stop, Error, Error, #file{fd = nil}}
+    end;
 
 handle_call({truncate, Pos}, _From, #file{fd=Fd}=File) ->
     {ok, Pos} = file:position(Fd, Pos),
@@ -525,7 +550,10 @@ handle_info({'DOWN', Ref, process, _Pid, _Info}, #file{db_monitor=Ref}=File) ->
         false -> {noreply, File}
     end.
 
-%% 从最后一个文件块向前寻找有效的header
+format_status(_Opt, [PDict, #file{} = File]) ->
+    {_Fd, FilePath} = couch_util:get_value(couch_file_fd, PDict),
+    [{data, [{"State", File}, {"InitialFilePath", FilePath}]}].
+
 find_header(Fd, Block) ->
     case (catch load_header(Fd, Block)) of
     {ok, Bin} ->
@@ -557,8 +585,8 @@ load_header(Fd, Pos, HeaderLen, RestBlock) ->
             <<RestBlock/binary, Missing/binary>>
     end,
     <<Md5Sig:16/binary, HeaderBin/binary>> =
-        iolist_to_binary(remove_block_prefixes(?PREFIX_SIZE, RawBin)), %% 验证是一个有效的header
-    Md5Sig = crypto:hash(md5, HeaderBin),
+        iolist_to_binary(remove_block_prefixes(?PREFIX_SIZE, RawBin)),
+    Md5Sig = couch_hash:md5_hash(HeaderBin),
     {ok, HeaderBin}.
 
 
@@ -610,18 +638,18 @@ read_raw_iolist_int(Fd, {Pos, _Size}, Len) -> % 0110 UPGRADE CODE
 read_raw_iolist_int(#file{fd = Fd, pread_limit = Limit} = F, Pos, Len) ->
     BlockOffset = Pos rem ?SIZE_BLOCK,
     TotalBytes = calculate_total_read_len(BlockOffset, Len),
-    case Pos + TotalBytes of
-    Size when Size > F#file.eof ->
-        couch_stats:increment_counter([pread, exceed_eof]),
-        {_Fd, Filepath} = get(couch_file_fd),
-        throw({read_beyond_eof, Filepath});
-    Size when Size > Limit ->
-        couch_stats:increment_counter([pread, exceed_limit]),
-        {_Fd, Filepath} = get(couch_file_fd),
-        throw({exceed_pread_limit, Filepath, Limit});
-    Size ->
-        {ok, <<RawBin:TotalBytes/binary>>} = file:pread(Fd, Pos, TotalBytes),
-        {remove_block_prefixes(BlockOffset, RawBin), Size}
+    if
+        (Pos + TotalBytes) > F#file.eof ->
+            couch_stats:increment_counter([pread, exceed_eof]),
+            {_Fd, Filepath} = get(couch_file_fd),
+            throw({read_beyond_eof, Filepath});
+        TotalBytes > Limit ->
+            couch_stats:increment_counter([pread, exceed_limit]),
+            {_Fd, Filepath} = get(couch_file_fd),
+            throw({exceed_pread_limit, Filepath, Limit});
+        true ->
+            {ok, <<RawBin:TotalBytes/binary>>} = file:pread(Fd, Pos, TotalBytes),
+            {remove_block_prefixes(BlockOffset, RawBin), Pos + TotalBytes}
     end.
 
 -spec extract_md5(iolist()) -> {binary(), iolist()}.
@@ -691,19 +719,22 @@ split_iolist([Sublist| Rest], SplitAt, BeginAcc) when is_list(Sublist) ->
 split_iolist([Byte | Rest], SplitAt, BeginAcc) when is_integer(Byte) ->
     split_iolist(Rest, SplitAt - 1, [Byte | BeginAcc]).
 
+monitored_by_pids() ->
+    {monitored_by, PidsAndRefs} = process_info(self(), monitored_by),
+    lists:filter(fun is_pid/1, PidsAndRefs).
 
 % System dbs aren't monitored by couch_stats_process_tracker
 is_idle(#file{is_sys=true}) ->
-    case process_info(self(), monitored_by) of
-        {monitored_by, []} -> true;
+    case monitored_by_pids() of
+        [] -> true;
         _ -> false
     end;
 is_idle(#file{is_sys=false}) ->
     Tracker = whereis(couch_stats_process_tracker),
-    case process_info(self(), monitored_by) of
-        {monitored_by, []} -> true;
-        {monitored_by, [Tracker]} -> true;
-        {monitored_by, [_]} -> exit(tracker_monitoring_failed);
+    case monitored_by_pids() of
+        [] -> true;
+        [Tracker] -> true;
+        [_] -> exit(tracker_monitoring_failed);
         _ -> false
     end.
 

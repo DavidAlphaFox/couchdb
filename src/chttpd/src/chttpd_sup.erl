@@ -18,17 +18,25 @@
 
 -export([init/1]).
 
--export([start_link/1]).
+-export([start_link/0]).
 
 -export([handle_config_change/5, handle_config_terminate/3]).
 
 %% Helper macro for declaring children of supervisor
 -define(CHILD(I, Type), {I, {I, start_link, []}, permanent, 100, Type, [I]}).
 
-start_link(Args) ->
-    supervisor:start_link({local,?MODULE}, ?MODULE, Args).
+start_link() ->
+    Arg = case fabric2_node_types:is_type(api_frontend) of
+        true -> normal;
+        false -> disabled
+    end,
+    supervisor:start_link({local,?MODULE}, ?MODULE, Arg).
 
-init([]) ->
+init(disabled) ->
+    couch_log:notice("~p : api_frontend disabled", [?MODULE]),
+    {ok, {{one_for_one, 3, 10}, []}};
+
+init(normal) ->
     Children = [
         {
             config_listener_mon,
@@ -80,21 +88,18 @@ maybe_replace(Key, Value, Settings) ->
     end.
 
 lru_opts() ->
-    case config:get("chttpd_auth_cache", "max_objects") of
-        MxObjs when is_integer(MxObjs), MxObjs > 0 ->
-            [{max_objects, MxObjs}];
-        _ ->
-            []
-    end ++
-    case config:get("chttpd_auth_cache", "max_size", "104857600") of
-        MxSize when is_integer(MxSize), MxSize > 0 ->
-            [{max_size, MxSize}];
-        _ ->
-            []
-    end ++
-    case config:get("chttpd_auth_cache", "max_lifetime", "600000") of
-        MxLT when is_integer(MxLT), MxLT > 0 ->
-            [{max_lifetime, MxLT}];
-        _ ->
-            []
-    end.
+    lists:foldl(fun append_if_set/2, [], [
+        {max_objects, config:get_integer("chttpd_auth_cache", "max_objects", 0)},
+        {max_size, config:get_integer("chttpd_auth_cache", "max_size", 104857600)},
+        {max_lifetime, config:get_integer("chttpd_auth_cache", "max_lifetime", 600000)}
+    ]).
+
+append_if_set({Key, Value}, Opts) when Value > 0 ->
+    [{Key, Value} | Opts];
+append_if_set({_Key, 0}, Opts) ->
+    Opts;
+append_if_set({Key, Value}, Opts) ->
+    couch_log:error(
+        "The value for `~s` should be string convertable "
+        "to integer which is >= 0 (got `~p`)", [Key, Value]),
+    Opts.

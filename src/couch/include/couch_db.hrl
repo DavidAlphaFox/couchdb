@@ -49,6 +49,7 @@
 
 -type branch() :: {Key::term(), Value::term(), Tree::term()}.
 -type path() :: {Start::pos_integer(), branch()}.
+-type update_type() :: replicated_changes | interactive_edit.
 
 -record(rev_info, {
     rev,
@@ -108,7 +109,10 @@
     % the json body object.
     body = {[]}, %% 数据体
 
-    atts = [] :: [couch_att:att()], % attachments 附件
+    % Atts can be a binary when a storage engine
+    % returns attachment info blob in compressed
+    % form.
+    atts = [] :: [couch_att:att()] | binary(), % attachments
 
     deleted = false,
 
@@ -200,6 +204,14 @@
     atts = []
 }).
 
+-record (fabric_changes_acc, {
+    db,
+    seq,
+    args,
+    options,
+    pending,
+    epochs
+}).
 
 -type doc() :: #doc{}.
 -type ddoc() :: #doc{}.
@@ -207,3 +219,6 @@
 -type sec_props() :: [tuple()].
 -type sec_obj() :: {sec_props()}.
 
+
+-define(record_to_keyval(Name, Record),
+    lists:zip(record_info(fields, Name), tl(tuple_to_list(Record)))).

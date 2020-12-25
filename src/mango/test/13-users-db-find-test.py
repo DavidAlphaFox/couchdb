@@ -12,10 +12,14 @@
 # the License.
 
 
-import mango, requests
+import mango, requests, unittest
 
+# Re-enable once the _users db is implemented
 
 class UsersDbFindTests(mango.UsersDbTests):
+    @classmethod
+    def setUpClass(klass):
+        raise unittest.SkipTest("Re-enable once the _users db is implemented")
 
     def test_simple_find(self):
         docs = self.db.find({"name": {"$eq": "demo02"}})
@@ -29,15 +33,9 @@ class UsersDbFindTests(mango.UsersDbTests):
         assert docs[0]["_id"] == "org.couchdb.user:demo02"
 
     def test_multi_cond_or(self):
-        docs = self.db.find({
-                "$and":[
-                    {"type": "user"},
-                    {"$or": [
-                        {"order": 1},
-                        {"order": 3}
-                    ]}
-                ]
-            })
+        docs = self.db.find(
+            {"$and": [{"type": "user"}, {"$or": [{"order": 1}, {"order": 3}]}]}
+        )
         assert len(docs) == 2
         assert docs[0]["_id"] == "org.couchdb.user:demo01"
         assert docs[1]["_id"] == "org.couchdb.user:demo03"
@@ -65,7 +63,6 @@ class UsersDbFindTests(mango.UsersDbTests):
 
 
 class UsersDbIndexFindTests(UsersDbFindTests):
-
     def setUp(self):
         self.db.create_index(["name"])
 
@@ -80,4 +77,3 @@ class UsersDbIndexFindTests(UsersDbFindTests):
     def test_sort(self):
         self.db.create_index(["order", "name"])
         super(UsersDbIndexFindTests, self).test_sort()
-

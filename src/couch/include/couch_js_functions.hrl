@@ -64,6 +64,15 @@
             });
         }
 
+        var available_schemes = [\"simple\", \"pbkdf2\", \"bcrypt\"];
+        if (newDoc.password_scheme
+                && available_schemes.indexOf(newDoc.password_scheme) == -1) {
+            throw({
+                forbidden: 'Password scheme `' + newDoc.password_scheme
+                    + '` not supported.'
+            });
+        }
+
         if (newDoc.password_scheme === \"pbkdf2\") {
             if (typeof(newDoc.iterations) !== \"number\") {
                throw({forbidden: \"iterations must be a number.\"});
@@ -127,11 +136,13 @@
 
         // no system roles in users db
         for (var i = 0; i < newDoc.roles.length; i++) {
-            if (newDoc.roles[i][0] === '_') {
-                throw({
-                    forbidden:
-                    'No system roles (starting with underscore) in users db.'
-                });
+            if (newDoc.roles[i] !== '_metrics') {
+              if (newDoc.roles[i][0] === '_') {
+                  throw({
+                      forbidden:
+                      'No system roles (starting with underscore) in users db.'
+                  });
+              }
             }
         }
 

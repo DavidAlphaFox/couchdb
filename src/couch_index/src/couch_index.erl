@@ -13,6 +13,8 @@
 -module(couch_index).
 -behaviour(gen_server).
 
+-compile(tuple_calls).
+
 -vsn(3).
 
 %% API
@@ -21,7 +23,7 @@
 -export([compact/1, compact/2, get_compactor_pid/1]).
 
 %% gen_server callbacks
--export([init/1, terminate/2, code_change/3]).
+-export([init/1, terminate/2, code_change/3, format_status/2]).
 -export([handle_call/3, handle_cast/2, handle_info/2]).
 
 
@@ -104,7 +106,7 @@ init({Mod, IdxState}) ->
                 Mod:get(idx_name, IdxState),
                 couch_index_util:hexsig(Mod:get(signature, IdxState))
             ],
-            couch_log:info("Opening index for db: ~s idx: ~s sig: ~p", Args),
+            couch_log:debug("Opening index for db: ~s idx: ~s sig: ~p", Args),
             proc_lib:init_ack({ok, self()}),
             gen_server:enter_loop(?MODULE, [], State);
         Other ->
@@ -131,7 +133,7 @@ terminate(Reason0, State) ->
         couch_index_util:hexsig(Mod:get(signature, IdxState)),
         Reason
     ],
-    couch_log:info("Closing index for db: ~s idx: ~s sig: ~p because ~r", Args),
+    couch_log:debug("Closing index for db: ~s idx: ~s sig: ~p because ~r", Args),
     ok.
 
 
@@ -366,26 +368,33 @@ handle_info(maybe_close, State) ->
     end;
 handle_info({'DOWN', _, _, _Pid, _}, #st{mod=Mod, idx_state=IdxState}=State) ->
     Args = [Mod:get(db_name, IdxState), Mod:get(idx_name, IdxState)],
-    couch_log:info("Index shutdown by monitor notice for db: ~s idx: ~s", Args),
+    couch_log:debug("Index shutdown by monitor notice for db: ~s idx: ~s", Args),
     catch send_all(State#st.waiters, shutdown),
     {stop, normal, State#st{waiters=[]}}.
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
+format_status(Opt, [PDict, State]) ->
+    #st{
+        mod = Mod,
+        waiters = Waiters,
+        idx_state = IdxState
+    } = State,
+    Scrubbed = State#st{waiters = {length, length(Waiters)}},
+    IdxSafeState = case erlang:function_exported(Mod, format_status, 2) of
+        true ->
+            Mod:format_status(Opt, [PDict, IdxState]);
+        false ->
+            []
+    end,
+    [{data, [{"State",
+        ?record_to_keyval(st, Scrubbed) ++ IdxSafeState
+    }]}].
+
 maybe_restart_updater(#st{waiters=[]}) ->
     ok;
-maybe_restart_updater(#st{mod=Mod, idx_state=IdxState}=State) ->
-    couch_util:with_db(Mod:get(db_name, IdxState), fun(Db) ->
-        UpdateSeq = couch_db:get_update_seq(Db),
-        CommittedSeq = couch_db:get_committed_update_seq(Db),
-        CanUpdate = UpdateSeq > CommittedSeq,
-        UOpts = Mod:get(update_options, IdxState),
-        case CanUpdate and lists:member(committed_only, UOpts) of
-            true -> couch_db:ensure_full_commit(Db);
-            false -> ok
-        end
-    end),
+maybe_restart_updater(#st{idx_state=IdxState}=State) ->
     couch_index_updater:run(State#st.updater, IdxState).
 
 
@@ -478,18 +487,25 @@ get(idx_name, _, _) ->
 get(signature, _, _) ->
     <<61,237,157,230,136,93,96,201,204,17,137,186,50,249,44,135>>.
 
-setup(Settings) ->
+setup_all() ->
+    Ctx = test_util:start_couch(),
     ok = meck:new([config], [passthrough]),
     ok = meck:new([test_index], [non_strict]),
+    ok = meck:expect(test_index, get, fun get/3),
+    Ctx.
+
+teardown_all(Ctx) ->
+    meck:unload(),
+    test_util:stop_couch(Ctx).
+
+setup(Settings) ->
+    meck:reset([config, test_index]),
     ok = meck:expect(config, get, fun(Section, Key) ->
         configure(Section, Key, Settings)
     end),
-    ok = meck:expect(test_index, get, fun get/3),
     {undefined, #st{mod = {test_index}}}.
 
 teardown(_, _) ->
-    (catch meck:unload(config)),
-    (catch meck:unload(test_index)),
     ok.
 
 configure("view_compaction", "enabled_recompaction", [Global, _Db, _Index]) ->
@@ -506,10 +522,12 @@ recompaction_configuration_test_() ->
         "Compaction tests",
         {
             setup,
-            fun test_util:start_couch/0, fun test_util:stop_couch/1,
+            fun setup_all/0,
+            fun teardown_all/1,
             {
                 foreachx,
-                fun setup/1, fun teardown/2,
+                fun setup/1,
+                fun teardown/2,
                 recompaction_configuration_tests()
             }
         }

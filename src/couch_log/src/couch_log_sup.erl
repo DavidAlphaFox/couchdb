@@ -26,7 +26,7 @@ start_link() ->
 
 init([]) ->
     ok = couch_log_config:init(),
-    {ok, {{one_for_one, 1, 1}, children()}}.
+    {ok, {{one_for_one, 10, 10}, children()}}.
 
 
 children() ->
@@ -62,6 +62,8 @@ handle_config_change("log", Key, _, _, S) ->
         "level" ->
             couch_log_config:reconfigure();
         "max_message_size" ->
+            couch_log_config:reconfigure();
+        "strip_last_msg" ->
             couch_log_config:reconfigure();
         _ ->
             % Someone may have changed the config for

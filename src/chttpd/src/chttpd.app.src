@@ -13,19 +13,6 @@
  {application, chttpd, [
     {description, "HTTP interface for CouchDB cluster"},
     {vsn, git},
-    {modules, [
-        chttpd,
-        chttpd_app,
-        chttpd_auth_cache,
-        chttpd_config_listener,
-        chttpd_db,
-        chttpd_external,
-        chttpd_misc,
-        chttpd_rewrite,
-        chttpd_show,
-        chttpd_sup,
-        chttpd_view
-    ]},
     {registered, [
         chttpd_sup,
         chttpd,
@@ -39,6 +26,7 @@
         couch_stats,
         config,
         couch,
+        ctrace,
         ets_lru,
         fabric
     ]},

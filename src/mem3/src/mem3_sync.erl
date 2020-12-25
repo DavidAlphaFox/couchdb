@@ -19,6 +19,9 @@
 -export([start_link/0, get_active/0, get_queue/0, push/1, push/2,
     remove_node/1, remove_shard/1, initial_sync/1, get_backlog/0, nodes_db/0,
     shards_db/0, users_db/0, find_next_node/0]).
+-export([
+    local_dbs/0
+]).
 
 -import(queue, [in/2, out/1, to_list/1, join/2, from_list/1, is_empty/1]).
 
@@ -137,11 +140,12 @@ handle_info({'EXIT', Active, Reason}, State) ->
         case Reason of {pending_changes, Count} ->
             maybe_resubmit(State, Job#job{pid = nil, count = Count});
         _ ->
-            try mem3:shards(mem3:dbname(Job#job.name)) of _ ->
-                timer:apply_after(5000, ?MODULE, push, [Job#job{pid=nil}])
-            catch error:database_does_not_exist ->
-                % no need to retry
-                ok
+            case mem3:db_is_current(Job#job.name) of
+                true ->
+                    timer:apply_after(5000, ?MODULE, push, [Job#job{pid=nil}]);
+                false ->
+                    % no need to retry (db deleted or recreated)
+                    ok
             end,
             State
         end;

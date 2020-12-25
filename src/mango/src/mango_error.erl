@@ -21,31 +21,19 @@
 ]).
 
 
-info(mango_idx, {no_usable_index, no_indexes_defined}) ->
-    {
-        400,
-        <<"no_usable_index">>,
-        <<"There are no indexes defined in this database.">>
-    };
-info(mango_idx, {no_usable_index, no_index_matching_name}) ->
-    {
-        400,
-        <<"no_usable_index">>,
-        <<"No index matches the index specified with \"use_index\"">>
-    };
 info(mango_idx, {no_usable_index, missing_sort_index}) ->
     {
         400,
         <<"no_usable_index">>,
-        <<"No index exists for this sort, try indexing by the sort fields.">>
+        <<"No index exists for this sort, "
+            "try indexing by the sort fields.">>
     };
-info(mango_cursor, {no_usable_index, selector_unsupported}) ->
+info(mango_idx, {no_usable_index, missing_sort_index_global}) ->
     {
         400,
         <<"no_usable_index">>,
-        <<"The index specified with \"use_index\" is not usable for the query.">>
+        <<"No global index exists for this sort, try indexing by the sort fields.">>
     };
-
 info(mango_json_bookmark, {invalid_bookmark, BadBookmark}) ->
     {
         400,
@@ -74,7 +62,7 @@ info(mango_cursor_text, {text_search_error, {error, {bad_request, Msg}}})
     };
 info(mango_cursor_text, {text_search_error, {error, Error}}) ->
     {
-        400,
+        500,
         <<"text_search_error">>,
         fmt("~p", [Error])
     };
@@ -327,7 +315,7 @@ info(mango_sort, {invalid_sort_json, BadSort}) ->
     {
         400,
         <<"invalid_sort_json">>,
-        fmt("Sort must be an array of sort specs, not: ~w", [BadSort])
+        fmt("Sort must be an array of sort specs, not: ~p", [BadSort])
     };
 info(mango_sort, {invalid_sort_dir, BadSpec}) ->
     {
@@ -339,7 +327,7 @@ info(mango_sort, {invalid_sort_field, BadField}) ->
     {
         400,
         <<"invalid_sort_field">>,
-        fmt("Invalid sort field: ~w", [BadField])
+        fmt("Invalid sort field: ~p", [BadField])
     };
 info(mango_sort, {unsupported, mixed_sort}) ->
     {

@@ -13,79 +13,24 @@
 -module(couch_replicator_utils).
 
 -export([
-   parse_rep_doc/2,
-   open_db/1,
-   close_db/1,
-   local_db_name/1,
-   start_db_compaction_notifier/2,
-   stop_db_compaction_notifier/1,
-   replication_id/2,
-   sum_stats/2,
-   is_deleted/1,
    rep_error_to_binary/1,
-   get_json_value/2,
-   get_json_value/3,
-   pp_rep_id/1,
+   iso8601/0,
    iso8601/1,
-   filter_state/3
+   rfc1123_local/0,
+   rfc1123_local/1,
+   remove_basic_auth_from_headers/1,
+   normalize_rep/1,
+   compare_reps/2,
+   default_headers_map/0,
+   parse_replication_states/1,
+   parse_int_param/5,
+   proplist_options/1
 ]).
 
--export([
-    handle_db_event/3
-]).
 
 -include_lib("couch/include/couch_db.hrl").
 -include("couch_replicator.hrl").
--include("couch_replicator_api_wrap.hrl").
-
--import(couch_util, [
-    get_value/2,
-    get_value/3
-]).
-
-
-open_db(#httpdb{} = HttpDb) ->
-    HttpDb;
-open_db(Db) ->
-    DbName = couch_db:name(Db),
-    UserCtx = couch_db:get_user_ctx(Db),
-    {ok, NewDb} = couch_db:open(DbName, [{user_ctx, UserCtx}]),
-    NewDb.
-
-
-close_db(#httpdb{}) ->
-    ok;
-close_db(Db) ->
-    couch_db:close(Db).
-
-
-local_db_name(#httpdb{}) ->
-    undefined;
-local_db_name(Db) ->
-    couch_db:name(Db).
-
-
-start_db_compaction_notifier(#httpdb{}, _) ->
-    nil;
-start_db_compaction_notifier(Db, Server) ->
-    DbName = couch_db:name(Db),
-    {ok, Pid} = couch_event:link_listener(
-            ?MODULE, handle_db_event, Server, [{dbname, DbName}]
-        ),
-    Pid.
-
-
-stop_db_compaction_notifier(nil) ->
-    ok;
-stop_db_compaction_notifier(Listener) ->
-    couch_event:stop_listener(Listener).
-
-
-handle_db_event(DbName, compacted, Server) ->
-    gen_server:cast(Server, {db_compacted, DbName}),
-    {ok, Server};
-handle_db_event(_DbName, _Event, Server) ->
-    {ok, Server}.
+-include_lib("couch_replicator/include/couch_replicator_api_wrap.hrl").
 
 
 rep_error_to_binary(Error) ->
@@ -103,74 +48,255 @@ error_reason(Reason) ->
     Reason.
 
 
-get_json_value(Key, Props) ->
-    get_json_value(Key, Props, undefined).
-
-get_json_value(Key, Props, Default) when is_atom(Key) ->
-    Ref = make_ref(),
-    case get_value(Key, Props, Ref) of
-        Ref ->
-            get_value(?l2b(atom_to_list(Key)), Props, Default);
-        Else ->
-            Else
-    end;
-get_json_value(Key, Props, Default) when is_binary(Key) ->
-    Ref = make_ref(),
-    case get_value(Key, Props, Ref) of
-        Ref ->
-            get_value(list_to_atom(?b2l(Key)), Props, Default);
-        Else ->
-            Else
-    end.
+-spec iso8601() -> binary().
+iso8601() ->
+    iso8601(erlang:system_time(second)).
 
 
-% pretty-print replication id
--spec pp_rep_id(#rep{} | rep_id()) -> string().
-pp_rep_id(#rep{id = RepId}) ->
-    pp_rep_id(RepId);
-pp_rep_id({Base, Extension}) ->
-    Base ++ Extension.
-
-
-% NV: TODO: this function is not used outside api wrap module
-% consider moving it there during final cleanup
-is_deleted(Change) ->
-    get_json_value(<<"deleted">>, Change, false).
-
-
-% NV: TODO: proxy some functions which used to be here, later remove
-% these and replace calls to their respective modules
-replication_id(Rep, Version) ->
-    couch_replicator_ids:replication_id(Rep, Version).
-
-
-sum_stats(S1, S2) ->
-    couch_replicator_stats:sum_stats(S1, S2).
-
-
-parse_rep_doc(Props, UserCtx) ->
-    couch_replicator_docs:parse_rep_doc(Props, UserCtx).
-
-
--spec iso8601(erlang:timestamp()) -> binary().
-iso8601({_Mega, _Sec, _Micro} = Timestamp) ->
-    {{Y, Mon, D}, {H, Min, S}} = calendar:now_to_universal_time(Timestamp),
+-spec iso8601(integer()) -> binary().
+iso8601(Sec) when is_integer(Sec) ->
+    Time = unix_sec_to_timestamp(Sec),
+    {{Y, Mon, D}, {H, Min, S}} = calendar:now_to_universal_time(Time),
     Format = "~B-~2..0B-~2..0BT~2..0B:~2..0B:~2..0BZ",
     iolist_to_binary(io_lib:format(Format, [Y, Mon, D, H, Min, S])).
 
 
-%% Filter replication info ejson by state provided. If it matches return
-%% the input value, if it doesn't return 'skip'. This is used from replicator
-%% fabric coordinator and worker.
--spec filter_state(atom(), [atom()], {[_ | _]}) -> {[_ | _]} | skip.
-filter_state(null = _State, _States, _Info) ->
-    skip;
-filter_state(_ = _State, [] = _States, Info) ->
-    Info;
-filter_state(State, States, Info) ->
-    case lists:member(State, States) of
-        true ->
-            Info;
-        false ->
-            skip
+rfc1123_local() ->
+    list_to_binary(httpd_util:rfc1123_date()).
+
+
+rfc1123_local(Sec) ->
+    Time = unix_sec_to_timestamp(Sec),
+    Local = calendar:now_to_local_time(Time),
+    list_to_binary(httpd_util:rfc1123_date(Local)).
+
+
+remove_basic_auth_from_headers(Headers) ->
+    Headers1 = mochiweb_headers:make(Headers),
+    case mochiweb_headers:get_value("Authorization", Headers1) of
+        undefined ->
+            {{undefined, undefined}, Headers};
+        Auth ->
+            {Basic, Base64} = lists:splitwith(fun(X) -> X =/= $\s end, Auth),
+            maybe_remove_basic_auth(string:to_lower(Basic), Base64, Headers1)
     end.
+
+
+maybe_remove_basic_auth("basic", " " ++ Base64, Headers) ->
+    Headers1 = mochiweb_headers:delete_any("Authorization", Headers),
+    {decode_basic_creds(Base64), mochiweb_headers:to_list(Headers1)};
+maybe_remove_basic_auth(_, _, Headers) ->
+    {{undefined, undefined}, mochiweb_headers:to_list(Headers)}.
+
+
+decode_basic_creds(Base64) ->
+    try re:split(base64:decode(Base64), ":", [{return, list}, {parts, 2}]) of
+        [User, Pass] ->
+            {User, Pass};
+        _ ->
+            {undefined, undefined}
+    catch
+        % Tolerate invalid B64 values here to avoid crashing replicator
+        error:function_clause ->
+            {undefined, undefined}
+    end.
+
+
+-spec compare_reps(#{} | null, #{} | null) -> boolean().
+compare_reps(Rep1, Rep2) ->
+    NormRep1 = normalize_rep(Rep1),
+    NormRep2 = normalize_rep(Rep2),
+    NormRep1 =:= NormRep2.
+
+
+% Normalize a rep map such that it doesn't contain time dependent fields
+% pids (like httpc pools), and options / props are sorted. This function would
+% used during comparisons.
+-spec normalize_rep(#{} | null) -> #{} | null.
+normalize_rep(null) ->
+    null;
+
+normalize_rep(#{} = Rep)->
+    #{
+        ?SOURCE := Source,
+        ?TARGET := Target,
+        ?OPTIONS := Options
+    } = Rep,
+    #{
+        ?SOURCE => normalize_endpoint(Source),
+        ?TARGET => normalize_endpoint(Target),
+        ?OPTIONS => Options
+    }.
+
+
+normalize_endpoint(<<DbName/binary>>) ->
+    DbName;
+
+normalize_endpoint(#{} = Endpoint) ->
+    Ks = [
+        <<"url">>,
+        <<"auth_props">>,
+        <<"headers">>,
+        <<"timeout">>,
+        <<"ibrowse_options">>,
+        <<"retries">>,
+        <<"http_connections">>,
+        <<"proxy_url">>
+    ],
+    maps:with(Ks, Endpoint).
+
+
+default_headers_map() ->
+    lists:foldl(fun({K, V}, Acc) ->
+        Acc#{list_to_binary(K) => list_to_binary(V)}
+    end, #{}, (#httpdb{})#httpdb.headers).
+
+
+parse_replication_states(undefined) ->
+    [];  % This is the default (wildcard) filter
+
+parse_replication_states(States) when is_list(States) ->
+    All = [?ST_RUNNING, ?ST_FAILED, ?ST_COMPLETED, ?ST_PENDING, ?ST_CRASHING],
+    AllSet = sets:from_list(All),
+    BinStates = [?l2b(string:to_lower(S)) || S <- string:tokens(States, ",")],
+    StatesSet = sets:from_list(BinStates),
+    Diff = sets:to_list(sets:subtract(StatesSet, AllSet)),
+    case Diff of
+        [] ->
+            BinStates;
+        _ ->
+            Args = [Diff, All],
+            Msg2 = io_lib:format("Unknown states ~p. Choose from: ~p", Args),
+            throw({query_parse_error, ?l2b(Msg2)})
+    end.
+
+
+parse_int_param(Req, Param, Default, Min, Max) ->
+    IntVal = try
+        list_to_integer(chttpd:qs_value(Req, Param, integer_to_list(Default)))
+    catch error:badarg ->
+        Msg1 = io_lib:format("~s must be an integer", [Param]),
+        throw({query_parse_error, ?l2b(Msg1)})
+    end,
+    case IntVal >= Min andalso IntVal =< Max of
+    true ->
+        IntVal;
+    false ->
+        Msg2 = io_lib:format("~s not in range of [~w,~w]", [Param, Min, Max]),
+        throw({query_parse_error, ?l2b(Msg2)})
+    end.
+
+
+proplist_options(#{} = OptionsMap) ->
+    maps:fold(fun(K, V, Acc) ->
+        [{binary_to_atom(K, utf8), V} | Acc]
+    end, [], OptionsMap).
+
+
+unix_sec_to_timestamp(Sec) when is_integer(Sec) ->
+    MegaSecPart = Sec div 1000000,
+    SecPart = Sec - MegaSecPart * 1000000,
+    {MegaSecPart, SecPart, 0}.
+
+
+-ifdef(TEST).
+
+-include_lib("eunit/include/eunit.hrl").
+
+remove_basic_auth_from_headers_test_() ->
+    [?_assertMatch({{User, Pass}, NoAuthHeaders},
+        remove_basic_auth_from_headers(Headers)) ||
+        {{User, Pass, NoAuthHeaders}, Headers} <- [
+            {
+                {undefined, undefined, []},
+                []
+            },
+            {
+                {undefined, undefined, [{"h", "v"}]},
+                [{"h", "v"}]
+            },
+            {
+                {undefined, undefined, [{"Authorization", "junk"}]},
+                [{"Authorization", "junk"}]
+            },
+            {
+                {undefined, undefined, []},
+                [{"Authorization", "basic X"}]
+            },
+            {
+                {"user", "pass", []},
+                [{"Authorization", "Basic " ++ b64creds("user", "pass")}]
+            },
+            {
+                {"user", "pass", []},
+                [{"AuThorization", "Basic " ++ b64creds("user", "pass")}]
+            },
+            {
+                {"user", "pass", []},
+                [{"Authorization", "bAsIc " ++ b64creds("user", "pass")}]
+            },
+            {
+                {"user", "pass", [{"h", "v"}]},
+                [
+                    {"Authorization", "Basic " ++ b64creds("user", "pass")},
+                    {"h", "v"}
+                ]
+            }
+        ]
+    ].
+
+
+b64creds(User, Pass) ->
+    base64:encode_to_string(User ++ ":" ++ Pass).
+
+
+normalize_rep_test_() ->
+    {
+        setup,
+        fun() -> meck:expect(config, get,
+            fun(_, _, Default) -> Default end)
+        end,
+        fun(_) -> meck:unload() end,
+        ?_test(begin
+            EJson1 = {[
+                {<<"source">>, <<"http://host.com/source_db">>},
+                {<<"target">>, <<"http://target.local/db">>},
+                {<<"doc_ids">>, [<<"a">>, <<"c">>, <<"b">>]},
+                {<<"other_field">>, <<"some_value">>}
+            ]},
+            Rep1 = couch_replicator_parse:parse_rep_doc(EJson1),
+            EJson2 = {[
+                {<<"other_field">>, <<"unrelated">>},
+                {<<"target">>, <<"http://target.local/db">>},
+                {<<"source">>, <<"http://host.com/source_db">>},
+                {<<"doc_ids">>, [<<"c">>, <<"a">>, <<"b">>]},
+                {<<"other_field2">>, <<"unrelated2">>}
+            ]},
+            Rep2 = couch_replicator_parse:parse_rep_doc(EJson2),
+            ?assertEqual(normalize_rep(Rep1), normalize_rep(Rep2))
+        end)
+    }.
+
+
+normalize_endpoint() ->
+    HttpDb =  #httpdb{
+        url = "http://host/db",
+        auth_props = #{
+            "key" => "val",
+            "nested" => #{<<"other_key">> => "other_val"}
+        },
+        headers = [{"k2","v2"}, {"k1","v1"}],
+        timeout = 30000,
+        ibrowse_options = [{k2, v2}, {k1, v1}],
+        retries = 10,
+        http_connections = 20
+    },
+    Expected = HttpDb#httpdb{
+        headers = [{"k1","v1"}, {"k2","v2"}],
+        ibrowse_options = [{k1, v1}, {k2, v2}]
+    },
+    ?assertEqual(Expected, normalize_endpoint(HttpDb)),
+    ?assertEqual(<<"local">>, normalize_endpoint(<<"local">>)).
+
+
+-endif.

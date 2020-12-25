@@ -9,7 +9,7 @@
 // WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 // License for the specific language governing permissions and limitations under
 // the License.
-
+couchTests.elixir = true;
 couchTests.users_db_security = function(debug) {
   var db_name = '_users';
   var usersDb = new CouchDB(db_name, {"X-Couch-Full-Commit":"false"});
@@ -374,18 +374,43 @@ couchTests.users_db_security = function(debug) {
   };
 
   run_on_modified_server(
-    [{section: "couch_httpd_auth",
-      key: "iterations", value: "1"},
-   {section: "admins",
-    key: "jan", value: "apple"}],
+    [
+        {
+          section:"couchdb",
+          key:"users_db_security_editable",
+          value:"true"
+        },
+        {
+          section: "couch_httpd_auth",
+          key: "iterations",
+          value: "1"
+        },
+        {
+          section: "admins",
+          key: "jan",
+          value: "apple"
+        }],
     function() {
       try {
         testFun();
       } finally {
         CouchDB.login("jan", "apple");
         usersDb.deleteDb(); // cleanup
-        sleep(5000);
+        waitForSuccess(function() {
+          var req = CouchDB.request("GET", db_name);
+          if (req.status == 404) {
+            return true
+          }
+          throw({});
+        }, 'usersDb.deleteDb')
         usersDb.createDb();
+        waitForSuccess(function() {
+          var req = CouchDB.request("GET", db_name);
+          if (req.status == 200) {
+            return true
+          }
+          throw({});
+        }, 'usersDb.creteDb')
       }
     }
   );

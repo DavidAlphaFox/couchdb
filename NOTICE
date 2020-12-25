@@ -1,5 +1,5 @@
 Apache CouchDB
-Copyright 2009-2016 The Apache Software Foundation
+Copyright 2009-2020 The Apache Software Foundation
 
 This product includes software developed at
 The Apache Software Foundation (http://www.apache.org/).
@@ -21,10 +21,6 @@ This product also includes the following third-party components:
  * ibrowse (http://github.com/cmullaparthi/ibrowse/tree/master)
 
    Copyright 2005-2012, Chandrashekhar Mullaparthi
-
- * ETap (http://github.com/ngerakines/etap/)
-
-   Copyright 2009, Nick Gerakines <nick@gerakines.net>
 
  * mimeparse.js (http://code.google.com/p/mimeparse/)
 
@@ -181,3 +177,19 @@ This product also includes the following third-party components:
 * velocity-react
 
   Copyright (c) 2015 Twitter, Inc.
+
+* esprima.js (https://github.com/jquery/esprima)
+
+  Copyright JS Foundation and other contributors, https://js.foundation/
+
+* escodegen.js (https://github.com/estools/escodegen)
+
+  Copyright (C) 2012 Yusuke Suzuki (twitter: @Constellation) and other contributors.
+
+* hyper
+
+  Copyright (c) 2014 Game Analytics ApS
+
+* recon
+
+  Copyright (c) 2012-2017, Frédéric Trottier-Hébert

@@ -54,7 +54,16 @@ add(#doc{body={Props0}}=DDoc, Idx) ->
     NewView = make_view(Idx),
     Views2 = lists:keystore(element(1, NewView), 1, Views1, NewView),
     Props1 = lists:keystore(<<"views">>, 1, Props0, {<<"views">>, {Views2}}),
-    {ok, DDoc#doc{body={Props1}}}.
+
+    {Opts0} = proplists:get_value(<<"options">>, Props1, {[]}),
+    Opts1 = case lists:keymember(<<"interactive">>, 1, Opts0) of
+        true -> Opts0;
+        false -> Opts0 ++ [{<<"interactive">>, true}]
+    end,
+    Props2 = lists:keystore(<<"options">>, 1, Props1, {<<"options">>, {Opts1}}),
+
+    Props3 = [{<<"autoupdate">>, false}],
+    {ok, DDoc#doc{body={Props2 ++ Props3}}}.
 
 
 remove(#doc{body={Props0}}=DDoc, Idx) ->
@@ -68,13 +77,15 @@ remove(#doc{body={Props0}}=DDoc, Idx) ->
     if Views2 /= Views1 -> ok; true ->
         ?MANGO_ERROR({index_not_found, Idx#idx.name})
     end,
-    Props1 = case Views2 of
+    Props3 = case Views2 of
         [] ->
-            lists:keydelete(<<"views">>, 1, Props0);
+            Props1 = lists:keydelete(<<"views">>, 1, Props0),
+            Props2 = lists:keydelete(<<"options">>, 1, Props1),
+            lists:keydelete(<<"autoupdate">>, 1, Props2);
         _ ->
             lists:keystore(<<"views">>, 1, Props0, {<<"views">>, {Views2}})
     end,
-    {ok, DDoc#doc{body={Props1}}}.
+    {ok, DDoc#doc{body={Props3}}}.
 
 
 from_ddoc({Props}) ->
@@ -104,7 +115,8 @@ to_json(Idx) ->
         {ddoc, Idx#idx.ddoc},
         {name, Idx#idx.name},
         {type, Idx#idx.type},
-        {def, {def_to_json(Idx#idx.def)}}
+        {def, {def_to_json(Idx#idx.def)}},
+        {build_status, Idx#idx.build_status}
     ]}.
 
 
@@ -120,12 +132,19 @@ is_usable(Idx, Selector, SortFields) ->
     % and the selector is not a text search (so requires a text index)
     RequiredFields = columns(Idx),
 
-    % sort fields are required to exist in the results so 
+    % sort fields are required to exist in the results so
     % we don't need to check the selector for these
     RequiredFields1 = ordsets:subtract(lists:usort(RequiredFields), lists:usort(SortFields)),
 
-    mango_selector:has_required_fields(Selector, RequiredFields1)
-        andalso not is_text_search(Selector).
+    % _id and _rev are implicitly in every document so
+    % we don't need to check the selector for these either
+    RequiredFields2 = ordsets:subtract(
+        RequiredFields1,
+        [<<"_id">>, <<"_rev">>]),
+
+    mango_selector:has_required_fields(Selector, RequiredFields2)
+        andalso not is_text_search(Selector)
+        andalso can_use_sort(RequiredFields, SortFields, Selector).
 
 
 is_text_search({[]}) ->
@@ -504,4 +523,31 @@ range_pos(Low, Arg, High) ->
                 _ ->
                     max
             end
+    end.
+
+
+% Can_use_sort works as follows:
+%
+% * no sort fields then we can use this
+% * Run out index columns we can't use this index
+% * If the current column is the start of the sort, return if sort is a prefix
+% * If the current column is constant, drop it and continue, else return false
+%
+% A constant column is a something that won't affect the sort
+% for example A: {$eq: 21}}
+%
+% Currently we only look at constant fields that are prefixes to the sort fields
+% set by the user. We considered adding in constant fields after sort fields
+% but were not 100% sure that it would not affect the sorting of the query.
+
+can_use_sort(_Cols, [], _Selector) ->
+    true;
+can_use_sort([], _SortFields, _Selector) ->
+    false;
+can_use_sort([Col | _] = Cols, [Col | _] = SortFields, _Selector) ->
+    lists:prefix(SortFields, Cols);
+can_use_sort([Col | RestCols], SortFields, Selector) ->
+    case mango_selector:is_constant_field(Selector, Col) of
+        true -> can_use_sort(RestCols, SortFields, Selector);
+        false -> false
     end.

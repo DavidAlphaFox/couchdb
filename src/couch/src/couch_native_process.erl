@@ -42,7 +42,7 @@
 -vsn(1).
 
 -export([start_link/0,init/1,terminate/2,handle_call/3,handle_cast/2,code_change/3,
-         handle_info/2]).
+         handle_info/2,format_status/2]).
 -export([set_timeout/2, prompt/2]).
 
 -define(STATE, native_proc_state).
@@ -124,6 +124,21 @@ handle_info({'EXIT',_,Reason}, State) ->
     {stop, Reason, State}.
 terminate(_Reason, _State) -> ok.
 code_change(_OldVersion, State, _Extra) -> {ok, State}.
+
+format_status(_Opt, [_PDict, State]) ->
+    #evstate{
+        ddocs = DDocs,
+        funs = Functions,
+        query_config = QueryConfig
+    } = State,
+    Scrubbed = State#evstate{
+        ddocs = {dict_size, dict:size(DDocs)},
+        funs = {length, length(Functions)},
+        query_config = {length, length(QueryConfig)}
+    },
+    [{data, [{"State",
+        ?record_to_keyval(evstate, Scrubbed)
+    }]}].
 
 run(#evstate{list_pid=Pid}=State, [<<"list_row">>, Row]) when is_pid(Pid) ->
     Pid ! {self(), list_row, Row},
@@ -225,6 +240,18 @@ ddoc(State, {_, Fun}, [<<"filters">>|_], [Docs, Req]) ->
         end
     end,
     Resp = lists:map(FilterFunWrapper, Docs),
+    {State, [true, Resp]};
+ddoc(State, {_, Fun}, [<<"views">>|_], [Docs]) ->
+    MapFunWrapper = fun(Doc) ->
+        case catch Fun(Doc) of
+        undefined -> true;
+        ok -> false;
+        false -> false;
+        [_|_] -> true;
+        {'EXIT', Error} -> couch_log:error("~p", [Error])
+        end
+    end,
+    Resp = lists:map(MapFunWrapper, Docs),
     {State, [true, Resp]};
 ddoc(State, {_, Fun}, [<<"shows">>|_], Args) ->
     Resp = case (catch apply(Fun, Args)) of
@@ -351,11 +378,11 @@ bindings(State, Sig, DDoc) ->
 % thanks to erlview, via:
 % http://erlang.org/pipermail/erlang-questions/2003-November/010544.html
 makefun(State, Source) ->
-    Sig = crypto:hash(md5, Source),
+    Sig = couch_hash:md5_hash(Source),
     BindFuns = bindings(State, Sig),
     {Sig, makefun(State, Source, BindFuns)}.
 makefun(State, Source, {DDoc}) ->
-    Sig = crypto:hash(md5, lists:flatten([Source, term_to_binary(DDoc)])),
+    Sig = couch_hash:md5_hash(lists:flatten([Source, term_to_binary(DDoc)])),
     BindFuns = bindings(State, Sig, {DDoc}),
     {Sig, makefun(State, Source, BindFuns)};
 makefun(_State, Source, BindFuns) when is_list(BindFuns) ->

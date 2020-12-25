@@ -12,7 +12,8 @@
 
 -module(fabric_db_meta).
 
--export([set_revs_limit/3, set_security/3, get_all_security/2]).
+-export([set_revs_limit/3, set_security/3, get_all_security/2,
+    set_purge_infos_limit/3]).
 
 -include_lib("fabric/include/fabric.hrl").
 -include_lib("mem3/include/mem3.hrl").
@@ -45,6 +46,29 @@ handle_revs_message(ok, _, {_Workers, 0}) ->
 handle_revs_message(ok, Worker, {Workers, Waiting}) ->
     {ok, {lists:delete(Worker, Workers), Waiting - 1}};
 handle_revs_message(Error, _, _Acc) ->
+    {error, Error}.
+
+
+set_purge_infos_limit(DbName, Limit, Options) ->
+    Shards = mem3:shards(DbName),
+    Workers = fabric_util:submit_jobs(Shards, set_purge_infos_limit, [Limit, Options]),
+    Handler = fun handle_purge_message/3,
+    Acc0 = {Workers, length(Workers) - 1},
+    case fabric_util:recv(Workers, #shard.ref, Handler, Acc0) of
+        {ok, ok} ->
+            ok;
+        {timeout, {DefunctWorkers, _}} ->
+            fabric_util:log_timeout(DefunctWorkers, "set_purged_docs_limit"),
+            {error, timeout};
+        Error ->
+            Error
+    end.
+
+handle_purge_message(ok, _, {_Workers, 0}) ->
+    {stop, ok};
+handle_purge_message(ok, Worker, {Workers, Waiting}) ->
+    {ok, {lists:delete(Worker, Workers), Waiting - 1}};
+handle_purge_message(Error, _, _Acc) ->
     {error, Error}.
 
 
@@ -111,9 +135,9 @@ check_sec_set_int(NumWorkers, SetWorkers) ->
         true -> throw(no_majority);
         false -> ok
     end,
-    % Hack to reuse fabric_view:is_progress_possible/1
+    % Hack to reuse fabric_ring:is_progress_possible/1
     FakeCounters = [{S, 0} || S <- SetWorkers],
-    case fabric_view:is_progress_possible(FakeCounters) of
+    case fabric_ring:is_progress_possible(FakeCounters) of
         false -> throw(no_ring);
         true -> ok
     end,

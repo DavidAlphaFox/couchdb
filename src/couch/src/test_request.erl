@@ -12,12 +12,22 @@
 
 -module(test_request).
 
+-export([copy/1, copy/2, copy/3]).
 -export([get/1, get/2, get/3]).
 -export([post/2, post/3, post/4]).
 -export([put/2, put/3, put/4]).
 -export([delete/1, delete/2, delete/3]).
 -export([options/1, options/2, options/3]).
 -export([request/3, request/4, request/5]).
+
+copy(Url) ->
+    copy(Url, []).
+
+copy(Url, Headers) ->
+    copy(Url, Headers, []).
+
+copy(Url, Headers, Opts) ->
+    request(copy, Url, Headers, [], Opts).
 
 get(Url) ->
     get(Url, []).
@@ -91,7 +101,11 @@ request(Method, Url, Headers, Body, Opts, N) ->
         {error, {'EXIT', {normal, _}}} ->
             % Connection closed right after a successful request that
             % used the same connection.
-            request(Method, Url, Headers, Body, N - 1);
+            request(Method, Url, Headers, Body, Opts, N - 1);
+        {error, retry_later} ->
+            % CouchDB is busy, let’s wait a bit
+            timer:sleep(3000 div N),
+            request(Method, Url, Headers, Body, Opts, N - 1);
         Error ->
             Error
     end.

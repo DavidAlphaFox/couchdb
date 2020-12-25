@@ -17,7 +17,7 @@
     to_json/1,
     incr_keys_examined/1,
     incr_docs_examined/1,
-    incr_quorum_docs_examined/1,
+    incr_docs_examined/2,
     incr_results_returned/1,
     log_start/1,
     log_end/1,
@@ -32,7 +32,6 @@ to_json(Stats) ->
     {[
         {total_keys_examined, Stats#execution_stats.totalKeysExamined},
         {total_docs_examined, Stats#execution_stats.totalDocsExamined},
-        {total_quorum_docs_examined, Stats#execution_stats.totalQuorumDocsExamined},
         {results_returned, Stats#execution_stats.resultsReturned},
         {execution_time_ms, Stats#execution_stats.executionTimeMs}
     ]}.
@@ -45,18 +44,17 @@ incr_keys_examined(Stats) ->
 
 
 incr_docs_examined(Stats) ->
-    Stats#execution_stats {
-        totalDocsExamined = Stats#execution_stats.totalDocsExamined + 1
-    }.
+    incr_docs_examined(Stats, 1).
 
 
-incr_quorum_docs_examined(Stats) ->
+incr_docs_examined(Stats, N) ->
     Stats#execution_stats {
-        totalQuorumDocsExamined = Stats#execution_stats.totalQuorumDocsExamined + 1
+        totalDocsExamined = Stats#execution_stats.totalDocsExamined + N
     }.
 
 
 incr_results_returned(Stats) ->
+    couch_stats:increment_counter([mango, results_returned]),
     Stats#execution_stats {
         resultsReturned = Stats#execution_stats.resultsReturned + 1
     }.
@@ -76,11 +74,13 @@ log_end(Stats) ->
     }.
 
 
-maybe_add_stats(Opts, UserFun, Stats, UserAcc) ->
+maybe_add_stats(Opts, UserFun, Stats0, UserAcc) ->
+    Stats1 = log_end(Stats0),
+    couch_stats:update_histogram([mango, query_time], Stats1#execution_stats.executionTimeMs),
+
     case couch_util:get_value(execution_stats, Opts) of
         true ->
-            Stats0 = log_end(Stats),
-            JSONValue = to_json(Stats0),
+            JSONValue = to_json(Stats1),
             Arg = {add_key, execution_stats, JSONValue},
             {_Go, FinalUserAcc} = UserFun(Arg, UserAcc),
             FinalUserAcc;

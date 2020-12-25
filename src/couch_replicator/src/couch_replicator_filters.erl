@@ -14,12 +14,13 @@
 
 -export([
     parse/1,
-    fetch/4,
+    fetch/3,
     view_type/2,
     ejsort/1
 ]).
 
 -include_lib("couch/include/couch_db.hrl").
+-include("couch_replicator.hrl").
 
 
 % Parse the filter from replication options proplist.
@@ -27,17 +28,17 @@
 % For `user` filter, i.e. filters specified as user code
 % in source database, this code doesn't fetch the filter
 % code, but only returns the name of the filter.
--spec parse([_]) ->
+-spec parse(#{}) ->
     {ok, nil} |
     {ok, {view, binary(), {[_]}}} |
     {ok, {user, {binary(), binary()}, {[_]}}} |
     {ok, {docids, [_]}} |
     {ok, {mango, {[_]}}} |
     {error, binary()}.
-parse(Options) ->
-    Filter = couch_util:get_value(filter, Options),
-    DocIds = couch_util:get_value(doc_ids, Options),
-    Selector = couch_util:get_value(selector, Options),
+parse(#{} = Options) ->
+    Filter = maps:get(<<"filter">>, Options, undefined),
+    DocIds = maps:get(<<"doc_ids">>, Options, undefined),
+    Selector = maps:get(<<"selector">>, Options, undefined),
     case {Filter, DocIds, Selector} of
         {undefined, undefined, undefined} ->
             {ok, nil};
@@ -53,7 +54,10 @@ parse(Options) ->
         {undefined, _, undefined} ->
             {ok, {docids, DocIds}};
         {undefined, undefined, _} ->
-            {ok, {mango, ejsort(mango_selector:normalize(Selector))}};
+            % Translate it to proplist as normalize doesn't know how
+            % to handle maps
+            Selector1 = ?JSON_DECODE(?JSON_ENCODE(Selector)),
+            {ok, {mango, ejsort(mango_selector:normalize(Selector1))}};
         _ ->
             Err = "`selector`, `filter` and `doc_ids` are mutually exclusive",
             {error, list_to_binary(Err)}
@@ -63,11 +67,11 @@ parse(Options) ->
 % Fetches body of filter function from source database. Guaranteed to either
 % return {ok, Body} or an {error, Reason}. Also assume this function might
 % block due to network / socket issues for an undeterminted amount of time.
--spec fetch(binary(), binary(), binary(), #user_ctx{}) ->
+-spec fetch(binary(), binary(), binary()) ->
     {ok, {[_]}} | {error, binary()}.
-fetch(DDocName, FilterName, Source, UserCtx) ->
+fetch(DDocName, FilterName, Source) ->
     {Pid, Ref} = spawn_monitor(fun() ->
-        try fetch_internal(DDocName, FilterName, Source, UserCtx) of
+        try fetch_internal(DDocName, FilterName, Source) of
             Resp ->
                 exit({exit_ok, Resp})
         catch
@@ -88,29 +92,30 @@ fetch(DDocName, FilterName, Source, UserCtx) ->
 
 
 % Get replication type and view (if any) from replication document props
--spec view_type([_], [_]) ->
-    {view, {binary(), binary()}} | {db, nil} | {error, binary()}.
-view_type(Props, Options) ->
-    case couch_util:get_value(<<"filter">>, Props) of
-        <<"_view">> ->
-            {QP}  = couch_util:get_value(query_params, Options, {[]}),
-            ViewParam = couch_util:get_value(<<"view">>, QP),
-            case re:split(ViewParam, <<"/">>) of
-                [DName, ViewName] ->
-                    {view, {<< "_design/", DName/binary >>, ViewName}};
-                _ ->
-                    {error, <<"Invalid `view` parameter.">>}
-            end;
+-spec view_type(#{}, #{}) ->
+    {binary(), #{}} | {error, binary()}.
+view_type(#{?FILTER := <<"_view">>}, #{} = Options) ->
+    QP = maps:get(<<"query_params">>, Options, #{}),
+    ViewParam = maps:get(<<"view">>, QP, <<>>),
+    case re:split(ViewParam, <<"/">>) of
+        [DName, ViewName] ->
+            DDocMap = #{
+                <<"ddoc">> => <<"_design/",DName/binary>>,
+                <<"view">> => ViewName
+            },
+            {<<"view">>, DDocMap};
         _ ->
-            {db, nil}
-    end.
+            {error, <<"Invalid `view` parameter.">>}
+    end;
+
+view_type(#{}, #{}) ->
+    {<<"db">>, #{}}.
 
 
 % Private functions
 
-fetch_internal(DDocName, FilterName, Source, UserCtx) ->
-    Db = case (catch couch_replicator_api_wrap:db_open(Source,
-        [{user_ctx, UserCtx}])) of
+fetch_internal(DDocName, FilterName, Source) ->
+    Db = case (catch couch_replicator_api_wrap:db_open(Source)) of
     {ok, Db0} ->
         Db0;
     DbError ->
@@ -145,16 +150,16 @@ fetch_internal(DDocName, FilterName, Source, UserCtx) ->
                      couch_replicator_api_wrap:db_uri(Source),
                      couch_util:to_binary(CodeError)]
                  ),
-                 throw({fetch_error, CodeErrorMsg})
+                 throw({fetch_error, iolist_to_binary(CodeErrorMsg)})
          end
     after
         couch_replicator_api_wrap:db_close(Db)
     end.
 
 
--spec query_params([_]) -> {[_]}.
-query_params(Options)->
-    couch_util:get_value(query_params, Options, {[]}).
+-spec query_params(#{}) -> #{}.
+query_params(#{} = Options)->
+    maps:get(<<"query_params">>, Options, #{}).
 
 
 parse_user_filter(Filter) ->

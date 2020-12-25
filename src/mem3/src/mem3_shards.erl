@@ -20,8 +20,9 @@
 -export([handle_config_change/5, handle_config_terminate/3]).
 
 -export([start_link/0]).
+-export([opts_for_db/1]).
 -export([for_db/1, for_db/2, for_docid/2, for_docid/3, get/3, local/1, fold/2]).
--export([for_shard_name/1]).
+-export([for_shard_range/1]).
 -export([set_max_size/1]).
 -export([get_changes_pid/0]).
 
@@ -45,6 +46,15 @@
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
+opts_for_db(DbName) ->
+    {ok, Db} = mem3_util:ensure_exists(mem3_sync:shards_db()),
+    case couch_db:open_doc(Db, DbName, [ejson_body]) of
+        {ok, #doc{body = {Props}}} ->
+            mem3_util:get_shard_opts(Props);
+        {not_found, _} ->
+            erlang:error(database_does_not_exist, ?b2l(DbName))
+    end.
+
 for_db(DbName) ->
     for_db(DbName, []).
 
@@ -67,21 +77,16 @@ for_docid(DbName, DocId) ->
     for_docid(DbName, DocId, []).
 
 for_docid(DbName, DocId, Options) ->
-    HashKey = mem3_util:hash(DocId),
+    HashKey = mem3_hash:calculate(DbName, DocId),
     ShardHead = #shard{
-        name = '_',
-        node = '_',
         dbname = DbName,
-        range = ['$1','$2'],
-        ref = '_'
+        range = ['$1', '$2'],
+        _ = '_'
     },
     OrderedShardHead = #ordered_shard{
-        name = '_',
-        node = '_',
         dbname = DbName,
-        range = ['$1','$2'],
-        ref = '_',
-        order = '_'
+        range = ['$1', '$2'],
+        _ = '_'
     },
     Conditions = [{'=<', '$1', HashKey}, {'=<', HashKey, '$2'}],
     ShardSpec = {ShardHead, Conditions, ['$_']},
@@ -100,41 +105,34 @@ for_docid(DbName, DocId, Options) ->
         false -> mem3_util:downcast(Shards)
     end.
 
-for_shard_name(ShardName) ->
-    for_shard_name(ShardName, []).
-
-for_shard_name(ShardName, Options) ->
+for_shard_range(ShardName) ->
     DbName = mem3:dbname(ShardName),
+    [B, E] = mem3:range(ShardName),
     ShardHead = #shard{
-        name = ShardName,
-        node = '_',
         dbname = DbName,
-        range = '_',
-        ref = '_'
+        range = ['$1', '$2'],
+        _ = '_'
     },
     OrderedShardHead = #ordered_shard{
-        name = ShardName,
-        node = '_',
         dbname = DbName,
-        range = '_',
-        ref = '_',
-        order = '_'
+        range = ['$1', '$2'],
+        _ = '_'
     },
-    ShardSpec = {ShardHead, [], ['$_']},
-    OrderedShardSpec = {OrderedShardHead, [], ['$_']},
+    % see mem3_util:range_overlap/2 for an explanation how it works
+    Conditions = [{'=<', '$1', E}, {'=<', B, '$2'}],
+    ShardSpec = {ShardHead, Conditions, ['$_']},
+    OrderedShardSpec = {OrderedShardHead, Conditions, ['$_']},
     Shards = try ets:select(?SHARDS, [ShardSpec, OrderedShardSpec]) of
         [] ->
-            filter_shards_by_name(ShardName, load_shards_from_disk(DbName));
+            filter_shards_by_range([B, E], load_shards_from_disk(DbName));
         Else ->
             gen_server:cast(?MODULE, {cache_hit, DbName}),
             Else
     catch error:badarg ->
-        filter_shards_by_name(ShardName, load_shards_from_disk(DbName))
+        filter_shards_by_range([B, E], load_shards_from_disk(DbName))
     end,
-    case lists:member(ordered, Options) of
-        true  -> Shards;
-        false -> mem3_util:downcast(Shards)
-    end.
+    mem3_util:downcast(Shards).
+
 
 get(DbName, Node, Range) ->
     Res = lists:foldl(fun(#shard{node=N, range=R}=S, Acc) ->
@@ -156,11 +154,10 @@ local(DbName) ->
     lists:filter(Pred, for_db(DbName)).
 
 fold(Fun, Acc) ->
-    DbName = config:get("mem3", "shards_db", "_dbs"),
-    {ok, Db} = mem3_util:ensure_exists(DbName),
+    {ok, Db} = mem3_util:ensure_exists(mem3_sync:shards_db()),
     FAcc = {Db, Fun, Acc},
     try
-        {ok, _, LastAcc} = couch_db:enum_docs(Db, fun fold_fun/3, FAcc, []),
+        {ok, LastAcc} = couch_db:fold_docs(Db, fun fold_fun/2, FAcc),
         {_Db, _UFun, UAcc} = LastAcc,
         UAcc
     after
@@ -194,6 +191,7 @@ handle_config_terminate(_Server, _Reason, _State) ->
     erlang:send_after(?RELISTEN_DELAY, whereis(?MODULE), restart_config_listener).
 
 init([]) ->
+    couch_util:set_mqd_off_heap(?MODULE),
     ets:new(?SHARDS, [
         bag,
         public,
@@ -305,10 +303,10 @@ start_changes_listener(SinceSeq) ->
     end),
     Pid.
 
-fold_fun(#full_doc_info{}=FDI, _, Acc) ->
+fold_fun(#full_doc_info{}=FDI, Acc) ->
     DI = couch_doc:to_doc_info(FDI),
-    fold_fun(DI, nil, Acc);
-fold_fun(#doc_info{}=DI, _, {Db, UFun, UAcc}) ->
+    fold_fun(DI, Acc);
+fold_fun(#doc_info{}=DI, {Db, UFun, UAcc}) ->
     case couch_db:open_doc(Db, DI, [ejson_body, conflicts]) of
         {ok, Doc} ->
             {Props} = Doc#doc.body,
@@ -320,14 +318,13 @@ fold_fun(#doc_info{}=DI, _, {Db, UFun, UAcc}) ->
     end.
 
 get_update_seq() ->
-    DbName = config:get("mem3", "shards_db", "_dbs"),
-    {ok, Db} = mem3_util:ensure_exists(DbName),
+    {ok, Db} = mem3_util:ensure_exists(mem3_sync:shards_db()),
+    Seq = couch_db:get_update_seq(Db),
     couch_db:close(Db),
-    couch_db:get_update_seq(Db).
+    Seq.
 
 listen_for_changes(Since) ->
-    DbName = config:get("mem3", "shards_db", "_dbs"),
-    {ok, Db} = mem3_util:ensure_exists(DbName),
+    {ok, Db} = mem3_util:ensure_exists(mem3_sync:shards_db()),
     Args = #changes_args{
         feed = "continuous",
         since = Since,
@@ -361,7 +358,7 @@ changes_callback({change, {Change}, _}, _) ->
                 ets:insert(?OPENERS, {DbName, Writer}),
                 Msg = {cache_insert_change, DbName, Writer, Seq},
                 gen_server:cast(?MODULE, Msg),
-                [create_if_missing(mem3:name(S)) || S
+                [create_if_missing(mem3:name(S), mem3:engine(S)) || S
                     <- Shards, mem3:node(S) =:= node()]
             end
         end
@@ -372,8 +369,7 @@ changes_callback(timeout, _) ->
 
 load_shards_from_disk(DbName) when is_binary(DbName) ->
     couch_stats:increment_counter([mem3, shard_cache, miss]),
-    X = ?l2b(config:get("mem3", "shards_db", "_dbs")),
-    {ok, Db} = mem3_util:ensure_exists(X),
+    {ok, Db} = mem3_util:ensure_exists(mem3_sync:shards_db()),
     try
         load_shards_from_db(Db, DbName)
     after
@@ -405,27 +401,25 @@ load_shards_from_db(ShardDb, DbName) ->
 
 load_shards_from_disk(DbName, DocId)->
     Shards = load_shards_from_disk(DbName),
-    HashKey = mem3_util:hash(DocId),
+    HashKey = mem3_hash:calculate(hd(Shards), DocId),
     [S || S <- Shards, in_range(S, HashKey)].
 
 in_range(Shard, HashKey) ->
     [B, E] = mem3:range(Shard),
     B =< HashKey andalso HashKey =< E.
 
-create_if_missing(Name) ->
-    DbDir = config:get("couchdb", "database_dir"),
-    Filename = filename:join(DbDir, ?b2l(Name) ++ ".couch"),
-    case filelib:is_regular(Filename) of
-    true ->
-        ok;
-    false ->
-        case couch_server:create(Name, [?ADMIN_CTX]) of
-        {ok, Db} ->
-            couch_db:close(Db);
-        Error ->
-            couch_log:error("~p tried to create ~s, got ~p",
-                [?MODULE, Name, Error])
-        end
+create_if_missing(Name, Options) ->
+    case couch_server:exists(Name) of
+        true ->
+            ok;
+        false ->
+            case couch_server:create(Name, [?ADMIN_CTX] ++ Options) of
+            {ok, Db} ->
+                couch_db:close(Db);
+            Error ->
+                couch_log:error("~p tried to create ~s, got ~p",
+                    [?MODULE, Name, Error])
+            end
     end.
 
 cache_insert(#st{cur_size=Cur}=St, DbName, Writer, Timeout) ->
@@ -519,17 +513,12 @@ flush_write(DbName, Writer, WriteTimeout) ->
         erlang:exit({mem3_shards_write_timeout, DbName})
     end.
 
-filter_shards_by_name(Name, Shards) ->
-    filter_shards_by_name(Name, [], Shards).
 
-filter_shards_by_name(_, Matches, []) ->
-    Matches;
-filter_shards_by_name(Name, Matches, [#ordered_shard{name=Name}=S|Ss]) ->
-    filter_shards_by_name(Name, [S|Matches], Ss);
-filter_shards_by_name(Name, Matches, [#shard{name=Name}=S|Ss]) ->
-    filter_shards_by_name(Name, [S|Matches], Ss);
-filter_shards_by_name(Name, Matches, [_|Ss]) ->
-    filter_shards_by_name(Name, Matches, Ss).
+filter_shards_by_range(Range, Shards)->
+    lists:filter(fun
+        (#ordered_shard{range = R}) -> mem3_util:range_overlap(Range, R);
+        (#shard{range = R}) -> mem3_util:range_overlap(Range, R)
+    end, Shards).
 
 
 -ifdef(TEST).
@@ -542,25 +531,30 @@ filter_shards_by_name(Name, Matches, [_|Ss]) ->
 
 mem3_shards_test_() ->
     {
-        foreach,
-        fun setup/0,
-        fun teardown/1,
-        [
-            t_maybe_spawn_shard_writer_already_exists(),
-            t_maybe_spawn_shard_writer_new(),
-            t_flush_writer_exists_normal(),
-            t_flush_writer_times_out(),
-            t_flush_writer_crashes(),
-            t_writer_deletes_itself_when_done(),
-            t_writer_does_not_delete_other_writers_for_same_shard(),
-            t_spawn_writer_in_load_shards_from_db(),
-            t_cache_insert_takes_new_update(),
-            t_cache_insert_ignores_stale_update_and_kills_worker()
-        ]
+        setup,
+        fun setup_all/0,
+        fun teardown_all/1,
+        {
+            foreach,
+            fun setup/0,
+            fun teardown/1,
+            [
+                t_maybe_spawn_shard_writer_already_exists(),
+                t_maybe_spawn_shard_writer_new(),
+                t_flush_writer_exists_normal(),
+                t_flush_writer_times_out(),
+                t_flush_writer_crashes(),
+                t_writer_deletes_itself_when_done(),
+                t_writer_does_not_delete_other_writers_for_same_shard(),
+                t_spawn_writer_in_load_shards_from_db(),
+                t_cache_insert_takes_new_update(),
+                t_cache_insert_ignores_stale_update_and_kills_worker()
+            ]
+        }
     }.
 
 
-setup() ->
+setup_all() ->
     ets:new(?SHARDS, [bag, public, named_table, {keypos, #shard.dbname}]),
     ets:new(?OPENERS, [bag, public, named_table]),
     ets:new(?DBS, [set, public, named_table]),
@@ -569,12 +563,23 @@ setup() ->
     ok.
 
 
-teardown(_) ->
+teardown_all(_) ->
     meck:unload(),
     ets:delete(?ATIMES),
     ets:delete(?DBS),
     ets:delete(?OPENERS),
     ets:delete(?SHARDS).
+
+
+setup() ->
+    ets:delete_all_objects(?ATIMES),
+    ets:delete_all_objects(?DBS),
+    ets:delete_all_objects(?OPENERS),
+    ets:delete_all_objects(?SHARDS).
+
+
+teardown(_) ->
+    ok.
 
 
 t_maybe_spawn_shard_writer_already_exists() ->
@@ -670,7 +675,9 @@ t_spawn_writer_in_load_shards_from_db() ->
         ?assertMatch({cache_insert, ?DB, Pid, 1} when is_pid(Pid), Cast),
         {cache_insert, _, WPid, _} = Cast,
         exit(WPid, kill),
-        ?assertEqual([{?DB, WPid}], ets:tab2list(?OPENERS))
+        ?assertEqual([{?DB, WPid}], ets:tab2list(?OPENERS)),
+        meck:unload(couch_db),
+        meck:unload(mem3_util)
     end).
 
 
@@ -735,42 +742,25 @@ spawn_link_mock_writer(Db, Shards, Timeout) ->
 
 
 mem3_shards_changes_test_() -> {
-    "Test mem3_shards changes listener", {
-        foreach,
-        fun setup_changes/0, fun teardown_changes/1,
+    "Test mem3_shards changes listener",
+    {
+        setup,
+        fun test_util:start_couch/0, fun test_util:stop_couch/1,
         [
-            fun should_kill_changes_listener_on_shutdown/1
+            fun should_kill_changes_listener_on_shutdown/0
         ]
     }
 }.
 
 
-setup_changes() ->
-    RespDb = test_util:fake_db([{name, <<"dbs">>}, {update_seq, 0}]),
-    ok = meck:expect(mem3_util, ensure_exists, ['_'], {ok, RespDb}),
-    ok = meck:expect(couch_db, close, ['_'], ok),
-    ok = application:start(config),
+should_kill_changes_listener_on_shutdown() ->
     {ok, Pid} = ?MODULE:start_link(),
+    {ok, ChangesPid} = get_changes_pid(),
+    ?assert(is_process_alive(ChangesPid)),
     true = erlang:unlink(Pid),
-    Pid.
-
-
-teardown_changes(Pid) ->
-    true = exit(Pid, shutdown),
-    ok = application:stop(config),
-    meck:unload().
-
-
-should_kill_changes_listener_on_shutdown(Pid) ->
-    ?_test(begin
-        ?assert(is_process_alive(Pid)),
-        {ok, ChangesPid} = get_changes_pid(),
-        ?assert(is_process_alive(ChangesPid)),
-        true = test_util:stop_sync_throw(
-            ChangesPid, fun() -> exit(Pid, shutdown) end, wait_timeout),
-        ?assertNot(is_process_alive(ChangesPid)),
-        ok
-    end).
-
+    true = test_util:stop_sync_throw(
+        ChangesPid, fun() -> exit(Pid, shutdown) end, wait_timeout),
+    ?assertNot(is_process_alive(ChangesPid)),
+    exit(Pid, shutdown).
 
 -endif.

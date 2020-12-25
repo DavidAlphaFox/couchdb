@@ -14,10 +14,7 @@ Dependencies
 
 You need the following to run tests:
 
-* `Python                 <https://www.python.org/>`_
-* `nose                   <https://nose.readthedocs.io/en/latest/>`_
-* `requests               <http://docs.python-requests.org/>`_
-* `hypothesis             <https://pypi.python.org/pypi/hypothesis>`_
+* `Python 3               <https://www.python.org/>`_
 
 You need the following optionally to build documentation:
 
@@ -60,7 +57,7 @@ Debian-based (inc. Ubuntu) Systems
 ::
 
     sudo apt-get install help2man python-sphinx gnupg nodejs npm \
-         python-hypothesis python-requests python-nose
+         python3 python3-venv
 
 Gentoo-based Systems
 ~~~~~~~~~~~~~~~~~~~~
@@ -70,14 +67,14 @@ Gentoo-based Systems
     sudo emerge gnupg coreutils pkgconfig help2man sphinx python
     sudo pip install hypothesis requests nose
 
-RedHat-based (Fedora, Centos, RHEL) Systems
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Centos 7 and RHEL 7
+~~~~~~~~~~~~~~~~~~~
 
 ::
 
     sudo yum install help2man python-sphinx python-docutils \
-        python-pygments gnupg nodejs npm python-nose python-requests \
-        python-hypothesis
+        python-pygments gnupg nodejs npm
+
 
 Mac OS X
 ~~~~~~~~
@@ -89,7 +86,7 @@ Unless you want to install the optional dependencies, skip to the next section.
 
 Install what else we can with Homebrew::
 
-    brew install help2man gnupg md5sha1sum node spidermonkey
+    brew install help2man gnupg md5sha1sum node python
 
 If you don't already have pip installed, install it::
 
@@ -97,7 +94,7 @@ If you don't already have pip installed, install it::
 
 Now, install the required Python packages::
 
-    sudo pip install sphinx docutils pygments nose requests hypothesis sphinx_rtd_theme
+    sudo pip install sphinx docutils pygments sphinx_rtd_theme
 
 FreeBSD
 ~~~~~~~
@@ -150,7 +147,7 @@ to make targets::
     make eunit apps=couch,chttpd
 
     # Run only tests from couch_btree_tests suite
-    make eunit suites=couch_btree_tests
+    make eunit apps=couch suites=couch_btree
 
     # Run only only specific tests
     make eunit tests=btree_open_test,reductions_test
@@ -197,30 +194,6 @@ If you need to analyze only specific apps, you can specify them in familiar way
 See ``make help`` for more info and useful commands.
 
 Please report any problems to the developer's mailing list.
-
-Testing a cluster
------------------
-
-We use `Docker <https://docker.io>`_ to safely run a local three node
-cluster all inside a single docker container.
-
-Assuming you have Docker installed and running::
-
-    make docker-image
-
-This will create a docker image (tagged 'couchdb/dev-cluster') capable
-of running a joined three node cluster.
-
-To start it up::
-
-    make docker-start
-
-A three node cluster should now be running (you can now use ``docker ps``
-to find the exposed ports of the nodes).
-
-To stop it::
-
-    make docker-stop
 
 Releasing
 ---------

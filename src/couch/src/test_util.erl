@@ -15,6 +15,7 @@
 -include_lib("couch/include/couch_eunit.hrl").
 -include("couch_db.hrl").
 -include("couch_db_int.hrl").
+-include("couch_bt_engine.hrl").
 
 -export([init_code_path/0]).
 -export([source_file/1, build_file/1]).
@@ -31,6 +32,7 @@
 -export([with_process_restart/1, with_process_restart/2, with_process_restart/3]).
 -export([wait_process/1, wait_process/2]).
 -export([wait/1, wait/2, wait/3]).
+-export([wait_value/2, wait_other_value/2]).
 
 -export([start/1, start/2, start/3, stop/1]).
 
@@ -96,10 +98,15 @@ start_applications([App|Apps], Acc) when App == kernel; App == stdlib ->
     start_applications(Apps, Acc);
 start_applications([App|Apps], Acc) ->
     case application:start(App) of
+    {error, {already_started, crypto}} ->
+        start_applications(Apps, [crypto | Acc]);
     {error, {already_started, App}} ->
         io:format(standard_error, "Application ~s was left running!~n", [App]),
         application:stop(App),
         start_applications([App|Apps], Acc);
+    {error, Reason} ->
+        io:format(standard_error, "Cannot start application '~s', reason ~p~n", [App, Reason]),
+        throw({error, {cannot_start, App, Reason}});
     ok ->
         start_applications(Apps, [App|Acc])
     end.
@@ -218,6 +225,22 @@ wait(Fun, Timeout, Delay, Started, _Prev) ->
         Else
     end.
 
+wait_value(Fun, Value) ->
+    wait(fun() ->
+        case Fun() of
+            Value -> Value;
+            _ -> wait
+        end
+    end).
+
+wait_other_value(Fun, Value) ->
+    wait(fun() ->
+        case Fun() of
+            Value -> wait;
+            Other -> Other
+        end
+    end).
+
 start(Module) ->
     start(Module, [], []).
 
@@ -234,7 +257,8 @@ stop(#test_context{mocked = Mocked, started = Apps}) ->
     meck:unload(Mocked),
     stop_applications(Apps).
 
-fake_db(Fields) ->
+fake_db(Fields0) ->
+    {ok, Db, Fields} = maybe_set_engine(Fields0),
     Indexes = lists:zip(
             record_info(fields, db),
             lists:seq(2, record_info(size, db))
@@ -242,7 +266,27 @@ fake_db(Fields) ->
     lists:foldl(fun({FieldName, Value}, Acc) ->
         Idx = couch_util:get_value(FieldName, Indexes),
         setelement(Idx, Acc, Value)
-    end, #db{}, Fields).
+    end, Db, Fields).
+
+maybe_set_engine(Fields0) ->
+    case lists:member(engine, Fields0) of
+        true ->
+            {ok, #db{}, Fields0};
+        false ->
+            {ok, Header, Fields} = get_engine_header(Fields0),
+            Db = #db{engine = {couch_bt_engine, #st{header = Header}}},
+            {ok, Db, Fields}
+    end.
+
+get_engine_header(Fields) ->
+    Keys = [disk_version, update_seq, unused, id_tree_state,
+        seq_tree_state, local_tree_state, purge_seq, purged_docs,
+        security_ptr, revs_limit, uuid, epochs, compacted_seq],
+    {HeadFields, RestFields} = lists:partition(
+        fun({K, _}) -> lists:member(K, Keys) end, Fields),
+    Header0 = couch_bt_engine_header:new(),
+    Header = couch_bt_engine_header:set(Header0, HeadFields),
+    {ok, Header, RestFields}.
 
 now_us() ->
     {MegaSecs, Secs, MicroSecs} = os:timestamp(),

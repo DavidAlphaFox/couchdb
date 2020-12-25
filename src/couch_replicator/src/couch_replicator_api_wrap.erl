@@ -23,12 +23,11 @@
 -include("couch_replicator_api_wrap.hrl").
 
 -export([
-    db_open/2,
+    db_open/1,
     db_open/3,
     db_close/1,
     get_db_info/1,
     get_pending_count/2,
-    get_view_info/3,
     update_doc/3,
     update_doc/4,
     update_docs/3,
@@ -39,49 +38,39 @@
     open_doc_revs/6,
     changes_since/5,
     db_uri/1,
-    normalize_db/1
+    db_from_json/1
     ]).
 
--import(couch_replicator_httpc, [
-    send_req/3
-    ]).
-
--import(couch_util, [
-    encode_doc_id/1,
-    get_value/2,
-    get_value/3
-    ]).
 
 -define(MAX_WAIT, 5 * 60 * 1000).
 
 -define(MAX_URL_LEN, 7000).
 -define(MIN_URL_LEN, 200).
 
-db_uri(#httpdb{url = Url}) ->
+db_uri(#{<<"url">> := Url}) ->
     couch_util:url_strip_password(Url);
 
-db_uri(DbName) when is_binary(DbName) ->
-    ?b2l(DbName);
-
-db_uri(Db) ->
-    db_uri(couch_db:name(Db)).
+db_uri(#httpdb{url = Url}) ->
+    couch_util:url_strip_password(Url).
 
 
-db_open(Db, Options) ->
-    db_open(Db, Options, false).
+db_open(#{} = Db) ->
+    db_open(Db, false, #{}).
 
-db_open(#httpdb{} = Db1, _Options, Create) ->
-    {ok, Db} = couch_replicator_httpc:setup(Db1),
+
+db_open(#{} = Db0, Create, #{} = CreateParams) when is_boolean(Create) ->
+    {ok, Db} = couch_replicator_httpc:setup(db_from_json(Db0)),
     try
         case Create of
         false ->
             ok;
         true ->
-            send_req(Db, [{method, put}],
+            Db2 = maybe_append_create_query_params(Db, CreateParams),
+            send_req(Db2, [{method, put}],
                 fun(401, _, _) ->
-                    throw({unauthorized, ?l2b(db_uri(Db))});
+                    throw({unauthorized, ?l2b(db_uri(Db2))});
                 (403, _, _) ->
-                    throw({forbidden, ?l2b(db_uri(Db))});
+                    throw({forbidden, ?l2b(db_uri(Db2))});
                 (_, _, _) ->
                     ok
                 end)
@@ -117,50 +106,19 @@ db_open(#httpdb{} = Db1, _Options, Create) ->
         exit:Error ->
             db_close(Db),
             erlang:exit(Error)
-    end;
-db_open(DbName, Options, Create) ->
-    try
-        case Create of
-        false ->
-            ok;
-        true ->
-            ok = couch_httpd:verify_is_server_admin(
-                get_value(user_ctx, Options)),
-            couch_db:create(DbName, Options)
-        end,
-        case couch_db:open(DbName, Options) of
-        {error, {illegal_database_name, _}} ->
-            throw({db_not_found, DbName});
-        {not_found, _Reason} ->
-            throw({db_not_found, DbName});
-        {ok, _Db} = Success ->
-            Success
-        end
-    catch
-    throw:{unauthorized, _} ->
-        throw({unauthorized, DbName})
     end.
 
-db_close(#httpdb{httpc_pool = Pool}) ->
+db_close(#httpdb{httpc_pool = Pool} = HttpDb) ->
+    couch_replicator_auth:cleanup(HttpDb),
     unlink(Pool),
-    ok = couch_replicator_httpc_pool:stop(Pool);
-db_close(DbName) ->
-    catch couch_db:close(DbName).
+    ok = couch_replicator_httpc_pool:stop(Pool).
 
 
 get_db_info(#httpdb{} = Db) ->
     send_req(Db, [],
         fun(200, _, {Props}) ->
             {ok, Props}
-        end);
-get_db_info(Db) ->
-    DbName = couch_db:name(Db),
-    UserCtx = couch_db:get_user_ctx(Db),
-    {ok, InfoDb} = couch_db:open(DbName, [{user_ctx, UserCtx}]),
-    {ok, Info} = couch_db:get_db_info(InfoDb),
-    couch_db:close(InfoDb),
-    {ok, [{couch_util:to_binary(K), V} || {K, V} <- Info]}.
-
+        end).
 
 get_pending_count(#httpdb{} = Db, Seq) when is_number(Seq) ->
     % Source looks like Apache CouchDB and not Cloudant so we fall
@@ -177,26 +135,7 @@ get_pending_count(#httpdb{} = Db, Seq) ->
     Options = [{path, "_changes"}, {qs, [{"since", ?JSON_ENCODE(Seq)}, {"limit", "0"}]}],
     send_req(Db, Options, fun(200, _, {Props}) ->
         {ok, couch_util:get_value(<<"pending">>, Props, null)}
-    end);
-get_pending_count(Db, Seq) when is_number(Seq) ->
-    DbName = couch_db:name(Db),
-    UserCtx = couch_db:get_user_ctx(Db),
-    {ok, CountDb} = couch_db:open(DbName, [{user_ctx, UserCtx}]),
-    Pending = couch_db:count_changes_since(CountDb, Seq),
-    couch_db:close(CountDb),
-    {ok, Pending}.
-
-get_view_info(#httpdb{} = Db, DDocId, ViewName) ->
-    Path = io_lib:format("~s/_view/~s/_info", [DDocId, ViewName]),
-    send_req(Db, [{path, Path}],
-        fun(200, _, {Props}) ->
-            {VInfo} = couch_util:get_value(<<"view_index">>, Props, {[]}),
-            {ok, VInfo}
-        end);
-get_view_info(Db, DDocId, ViewName) ->
-    DbName = couch_db:name(Db),
-    {ok, VInfo} = couch_mrview:get_view_info(DbName, DDocId, ViewName),
-    {ok, [{couch_util:to_binary(K), V} || {K, V} <- VInfo]}.
+    end).
 
 
 ensure_full_commit(#httpdb{} = Db) ->
@@ -208,9 +147,7 @@ ensure_full_commit(#httpdb{} = Db) ->
             {ok, get_value(<<"instance_start_time">>, Props)};
         (_, _, {Props}) ->
             {error, get_value(<<"error">>, Props)}
-        end);
-ensure_full_commit(Db) ->
-    couch_db:ensure_full_commit(Db).
+        end).
 
 
 get_missing_revs(#httpdb{} = Db, IdRevs) ->
@@ -229,11 +166,10 @@ get_missing_revs(#httpdb{} = Db, IdRevs) ->
                 ),
                 {Id, MissingRevs, PossibleAncestors}
             end,
-            {ok, lists:map(ConvertToNativeFun, Props)}
-        end);
-get_missing_revs(Db, IdRevs) ->
-    couch_db:get_missing_revs(Db, IdRevs).
-
+            {ok, lists:map(ConvertToNativeFun, Props)};
+        (ErrCode, _, ErrMsg) when is_integer(ErrCode) ->
+            {error, {revs_diff_failed, ErrCode, ErrMsg}}
+        end).
 
 
 open_doc_revs(#httpdb{retries = 0} = HttpDb, Id, Revs, Options, _Fun, _Acc) ->
@@ -329,10 +265,8 @@ open_doc_revs(#httpdb{} = HttpDb, Id, Revs, Options, Fun, Acc) ->
                 wait = Wait
             },
             open_doc_revs(RetryDb, Id, Revs, Options, Fun, Acc)
-    end;
-open_doc_revs(Db, Id, Revs, Options, Fun, Acc) ->
-    {ok, Results} = couch_db:open_doc_revs(Db, Id, Revs, Options),
-    {ok, lists:foldl(fun(R, A) -> {_, A2} = Fun(R, A), A2 end, Acc, Results)}.
+    end.
+
 
 error_reason({http_request_failed, "GET", _Url, {error, timeout}}) ->
     timeout;
@@ -351,14 +285,7 @@ open_doc(#httpdb{} = Db, Id, Options) ->
             {ok, couch_doc:from_json_obj(Body)};
         (_, _, {Props}) ->
             {error, get_value(<<"error">>, Props)}
-        end);
-open_doc(Db, Id, Options) ->
-    case couch_db:open_doc(Db, Id, Options) of
-    {ok, _} = Ok ->
-        Ok;
-    {not_found, _Reason} ->
-        {error, <<"not_found">>}
-    end.
+        end).
 
 
 update_doc(Db, Doc, Options) ->
@@ -409,9 +336,7 @@ update_doc(#httpdb{} = HttpDb, #doc{id = DocId} = Doc, Options, Type) ->
                 {_, Error} ->
                     {error, Error}
                 end
-        end);
-update_doc(Db, Doc, Options, Type) ->
-    couch_db:update_doc(Db, Doc, Options, Type).
+        end).
 
 
 update_docs(Db, DocList, Options) ->
@@ -465,11 +390,10 @@ update_docs(#httpdb{} = HttpDb, DocList, Options, UpdateType) ->
            (413, _, _) ->
                 {error, request_body_too_large};
            (417, _, Results) when is_list(Results) ->
-                {ok, bulk_results_to_errors(DocList, Results, remote)}
-        end);
-update_docs(Db, DocList, Options, UpdateType) ->
-    Result = couch_db:update_docs(Db, DocList, Options, UpdateType),
-    {ok, bulk_results_to_errors(DocList, Result, UpdateType)}.
+                {ok, bulk_results_to_errors(DocList, Results, remote)};
+           (ErrCode, _, ErrMsg) when is_integer(ErrCode) ->
+                {error, {bulk_docs_failed, ErrCode, ErrMsg}}
+        end).
 
 
 changes_since(#httpdb{headers = Headers1, timeout = InactiveTimeout} = HttpDb,
@@ -490,9 +414,9 @@ changes_since(#httpdb{headers = Headers1, timeout = InactiveTimeout} = HttpDb,
     {undefined, undefined} ->
         QArgs1 = maybe_add_changes_filter_q_args(BaseQArgs, Options),
         {QArgs1, get, [], Headers1};
-    {undefined, _} when is_tuple(Selector) ->
+    {undefined, #{}} ->
         Headers2 = [{"Content-Type", "application/json"} | Headers1],
-        JsonSelector = ?JSON_ENCODE({[{<<"selector">>, Selector}]}),
+        JsonSelector = ?JSON_ENCODE(#{<<"selector">> => Selector}),
         {[{"filter", "_selector"} | BaseQArgs], post, JsonSelector, Headers2};
     {_, undefined} when is_list(DocIds) ->
         Headers2 = [{"Content-Type", "application/json"} | Headers1],
@@ -526,7 +450,9 @@ changes_since(#httpdb{headers = Headers1, timeout = InactiveTimeout} = HttpDb,
                             end,
                             parse_changes_feed(Options, UserFun2,
                                 DataStreamFun2)
-                        end)
+                        end);
+                 (ErrCode, _, ErrMsg) when is_integer(ErrCode) ->
+                    throw({retry_limit, {changes_req_failed, ErrCode, ErrMsg}})
             end)
     catch
         exit:{http_request_failed, _, _, max_backoff} ->
@@ -536,38 +462,7 @@ changes_since(#httpdb{headers = Headers1, timeout = InactiveTimeout} = HttpDb,
             throw(retry_no_limit);
         exit:{http_request_failed, _, _, _} = Error ->
             throw({retry_limit, Error})
-    end;
-changes_since(Db, Style, StartSeq, UserFun, Options) ->
-    DocIds = get_value(doc_ids, Options),
-    Selector = get_value(selector, Options),
-    Filter = case {DocIds, Selector} of
-    {undefined, undefined} ->
-        ?b2l(get_value(filter, Options, <<>>));
-    {_, undefined} ->
-        "_doc_ids";
-    {undefined, _} ->
-        "_selector"
-    end,
-    Args = #changes_args{
-        style = Style,
-        since = StartSeq,
-        filter = Filter,
-        feed = case get_value(continuous, Options, false) of
-            true ->
-                "continuous";
-            false ->
-                "normal"
-        end,
-        timeout = infinity
-    },
-    QueryParams = get_value(query_params, Options, {[]}),
-    Req = changes_json_req(Db, Filter, QueryParams, Options),
-    ChangesFeedFun = couch_changes:handle_db_changes(Args, {json_req, Req}, Db),
-    ChangesFeedFun(fun({change, Change, _}, _) ->
-            UserFun(json_to_doc_info(Change));
-        (_, _) ->
-            ok
-    end).
+    end.
 
 
 % internal functions
@@ -581,7 +476,8 @@ maybe_add_changes_filter_q_args(BaseQS, Options) ->
         ViewFields0 = [atom_to_list(F) || F <- record_info(fields,  mrargs)],
         ViewFields = ["key" | ViewFields0],
 
-        {Params} = get_value(query_params, Options, {[]}),
+        ParamsMap = #{} = get_value(query_params, Options, #{}),
+        Params = maps:to_list(ParamsMap),
         [{"filter", ?b2l(FilterName)} | lists:foldl(
             fun({K, V}, QSAcc) ->
                 Ks = couch_util:to_list(K),
@@ -612,29 +508,6 @@ parse_changes_feed(Options, UserFun, DataStreamFun) ->
         json_stream_parse:events(DataStreamFun, EventFun)
     end.
 
-changes_json_req(_Db, "", _QueryParams, _Options) ->
-    {[]};
-changes_json_req(_Db, "_doc_ids", _QueryParams, Options) ->
-    {[{<<"doc_ids">>, get_value(doc_ids, Options)}]};
-changes_json_req(_Db, "_selector", _QueryParams, Options) ->
-    {[{<<"selector">>, get_value(selector, Options)}]};
-changes_json_req(Db, FilterName, {QueryParams}, _Options) ->
-    {ok, Info} = couch_db:get_db_info(Db),
-    % simulate a request to db_name/_changes
-    {[
-        {<<"info">>, {Info}},
-        {<<"id">>, null},
-        {<<"method">>, 'GET'},
-        {<<"path">>, [couch_db:name(Db), <<"_changes">>]},
-        {<<"query">>, {[{<<"filter">>, FilterName} | QueryParams]}},
-        {<<"headers">>, []},
-        {<<"body">>, []},
-        {<<"peer">>, <<"replicator">>},
-        {<<"form">>, []},
-        {<<"cookie">>, []},
-        {<<"userCtx">>, couch_util:json_user_ctx(Db)}
-    ]}.
-
 
 options_to_query_args(HttpDb, Path, Options0) ->
     case lists:keytake(max_url_len, 1, Options0) of
@@ -654,7 +527,7 @@ options_to_query_args(HttpDb, Path, Options0) ->
             length("GET " ++ FullUrl ++ " HTTP/1.1\r\n") +
             length("&atts_since=") + 6,  % +6 = % encoded [ and ]
             PAs, MaxLen, []),
-        [{"atts_since", ?JSON_ENCODE(RevList)} | QueryArgs1]
+        [{"atts_since", ?b2l(iolist_to_binary(?JSON_ENCODE(RevList)))} | QueryArgs1]
     end.
 
 
@@ -895,7 +768,7 @@ json_to_doc_info({Props}) ->
         RevsInfo0 = lists:map(
             fun({Change}) ->
                 Rev = couch_doc:parse_rev(get_value(<<"rev">>, Change)),
-                Del = couch_replicator_utils:is_deleted(Change),
+                Del = get_value(<<"deleted">>, Change, false),
                 #rev_info{rev=Rev, deleted=Del}
             end, Changes),
 
@@ -1003,44 +876,95 @@ header_value(Key, Headers, Default) ->
     end.
 
 
-% Normalize an #httpdb{} or #db{} record such that it can be used for
-% comparisons. This means remove things like pids and also sort options / props.
-normalize_db(#httpdb{} = HttpDb) ->
+maybe_append_create_query_params(Db, Params) when map_size(Params) == 0 ->
+    Db;
+
+maybe_append_create_query_params(Db, #{} = Params) ->
+    ParamList = maps:to_list(Params),
+    NewUrl = Db#httpdb.url ++ "?" ++ mochiweb_util:urlencode(ParamList),
+    Db#httpdb{url = NewUrl}.
+
+
+db_from_json(#{} = DbMap) ->
+    #{
+        <<"url">> := Url,
+        <<"auth_props">> := Auth,
+        <<"headers">> := Headers0,
+        <<"ibrowse_options">> := IBrowseOptions0,
+        <<"timeout">> := Timeout,
+        <<"http_connections">> := HttpConnections,
+        <<"retries">> := Retries,
+        <<"proxy_url">> := ProxyUrl0
+    } = DbMap,
+    Headers = maps:fold(fun(K, V, Acc) ->
+        [{binary_to_list(K), binary_to_list(V)} | Acc]
+    end, [], Headers0),
+    IBrowseOptions = maps:fold(fun
+        (<<"socket_options">>, #{} = SockOpts, Acc) ->
+            SockOptsKVs = maps:fold(fun sock_opts_fold/3, [], SockOpts),
+            [{socket_options, SockOptsKVs} | Acc];
+        (<<"ssl_options">>, #{} = SslOpts, Acc) ->
+            SslOptsKVs = maps:fold(fun ssl_opts_fold/3, [], SslOpts),
+            [{ssl_options, SslOptsKVs} | Acc];
+        (K, V, Acc) when is_binary(V) ->
+            [{binary_to_atom(K, utf8), binary_to_list(V)} | Acc];
+        (K, V, Acc) ->
+            [{binary_to_atom(K, utf8), V} | Acc]
+    end, [], IBrowseOptions0),
+    ProxyUrl = case ProxyUrl0 of
+        null -> undefined;
+        V when is_binary(V) -> binary_to_list(V)
+    end,
     #httpdb{
-        url = HttpDb#httpdb.url,
-        oauth = HttpDb#httpdb.oauth,
-        headers = lists:keysort(1, HttpDb#httpdb.headers),
-        timeout = HttpDb#httpdb.timeout,
-        ibrowse_options = lists:keysort(1, HttpDb#httpdb.ibrowse_options),
-        retries = HttpDb#httpdb.retries,
-        http_connections = HttpDb#httpdb.http_connections
-    };
-
-normalize_db(<<DbName/binary>>) ->
-    DbName.
+        url = binary_to_list(Url),
+        auth_props = Auth,
+        headers = Headers,
+        ibrowse_options = IBrowseOptions,
+        timeout = Timeout,
+        http_connections = HttpConnections,
+        retries = Retries,
+        proxy_url = ProxyUrl
+    }.
 
 
--ifdef(TEST).
-
--include_lib("eunit/include/eunit.hrl").
-
-
-normalize_http_db_test() ->
-    HttpDb =  #httpdb{
-        url = "http://host/db",
-        oauth = #oauth{},
-        headers = [{"k2","v2"}, {"k1","v1"}],
-        timeout = 30000,
-        ibrowse_options = [{k2, v2}, {k1, v1}],
-        retries = 10,
-        http_connections = 20
-    },
-    Expected = HttpDb#httpdb{
-        headers = [{"k1","v1"}, {"k2","v2"}],
-        ibrowse_options = [{k1, v1}, {k2, v2}]
-    },
-    ?assertEqual(Expected, normalize_db(HttpDb)),
-    ?assertEqual(<<"local">>, normalize_db(<<"local">>)).
+send_req(#httpdb{} = HttpDb, Opts, Callback) when is_function(Callback) ->
+    couch_replicator_httpc:send_req(HttpDb, Opts, Callback).
 
 
--endif.
+get_value(K, Props) ->
+    couch_util:get_value(K, Props).
+
+
+get_value(K, Props, Default) ->
+    couch_util:get_value(K, Props, Default).
+
+
+encode_doc_id(DocId) ->
+    couch_util:encode_doc_id(DocId).
+
+
+
+% See couch_replicator_docs:ssl_params/1 for ssl parsed options
+% and http://erlang.org/doc/man/ssl.html#type-server_option
+% all latest SSL server options
+%
+ssl_opts_fold(K, V, Acc) when is_boolean(V); is_integer(V) ->
+    [{binary_to_atom(K, utf8), V} | Acc];
+
+ssl_opts_fold(K, null, Acc) ->
+    [{binary_to_atom(K, utf8), undefined} | Acc];
+
+ssl_opts_fold(<<"verify">>, V, Acc) ->
+    [{verify, binary_to_atom(V, utf8)} | Acc];
+
+ssl_opts_fold(K, V, Acc) when is_list(V) ->
+    [{binary_to_atom(K, utf8), binary_to_list(V)} | Acc].
+
+
+% See ?VALID_SOCK_OPTS in couch_replicator_docs for accepted socket options
+%
+sock_opts_fold(K, V, Acc) when is_binary(V) ->
+     [{binary_to_atom(K, utf8), binary_to_atom(V, utf8)} | Acc];
+
+sock_opts_fold(K, V, Acc) when is_boolean(V); is_integer(V) ->
+    [{binary_to_atom(K, utf8), V} | Acc].

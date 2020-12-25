@@ -179,12 +179,12 @@ parse_rev(Rev) when is_list(Rev) ->
     SplitRev = lists:splitwith(fun($-) -> false; (_) -> true end, Rev),
     case SplitRev of
         {Pos, [$- | RevId]} ->
-            IntPos = try list_to_integer(Pos) of
-                Val -> Val
+            try
+                IntPos = list_to_integer(Pos),
+                {IntPos, parse_revid(RevId)}
             catch
                 error:badarg -> throw({bad_request, <<"Invalid rev format">>})
-            end,
-            {IntPos, parse_revid(RevId)};
+            end;
         _Else -> throw({bad_request, <<"Invalid rev format">>})
     end;
 parse_rev(_BadRev) ->
@@ -200,7 +200,7 @@ parse_revs(_) ->
 
 validate_docid(DocId, DbName) ->
     case DbName =:= ?l2b(config:get("mem3", "shards_db", "_dbs")) andalso
-        lists:member(DocId, ?SYSTEM_DATABASES) of
+        couch_db:is_system_db_name(DocId) of
         true ->
             ok;
         false ->
@@ -275,9 +275,16 @@ transfer_fields([{<<"_revisions">>, {Props}} | Rest], Doc, DbName) ->
     true ->
         ok
     end,
-    [throw({doc_validation, "RevId isn't a string"}) ||
-            RevId <- RevIds, not is_binary(RevId)],
-    RevIds2 = [parse_revid(RevId) || RevId <- RevIds],
+    RevIds2 = lists:map(fun(RevId) ->
+        try
+            parse_revid(RevId)
+        catch
+            error:function_clause ->
+                throw({doc_validation, "RevId isn't a string"});
+            error:badarg ->
+                throw({doc_validation, "RevId isn't a valid hexadecimal"})
+        end
+    end, RevIds),
     transfer_fields(Rest, Doc#doc{revs={Start, RevIds2}}, DbName);
 
 transfer_fields([{<<"_deleted">>, B} | Rest], Doc, DbName) when is_boolean(B) ->
@@ -292,6 +299,11 @@ transfer_fields([{<<"_conflicts">>, _} | Rest], Doc, DbName) ->
     transfer_fields(Rest, Doc, DbName);
 transfer_fields([{<<"_deleted_conflicts">>, _} | Rest], Doc, DbName) ->
     transfer_fields(Rest, Doc, DbName);
+
+% special field for per doc access control, for future compatibility
+transfer_fields([{<<"_access">>, _} = Field | Rest],
+    #doc{body=Fields} = Doc, DbName) ->
+    transfer_fields(Rest, Doc#doc{body=[Field|Fields]}, DbName);
 
 % special fields for replication documents
 transfer_fields([{<<"_replication_state">>, _} = Field | Rest],
@@ -366,6 +378,17 @@ rev_info({#doc{} = Doc, {Pos, [RevId | _]}}) ->
         deleted = Doc#doc.deleted,
         body_sp = undefined,
         seq = undefined,
+        rev = {Pos, RevId}
+    };
+rev_info({#{} = RevInfo, {Pos, [RevId | _]}}) ->
+    #{
+        deleted := Deleted,
+        sequence := Sequence
+    } = RevInfo,
+    #rev_info{
+        deleted = Deleted,
+        body_sp = undefined,
+        seq = fabric2_fdb:vs_to_seq(Sequence),
         rev = {Pos, RevId}
     }.
 

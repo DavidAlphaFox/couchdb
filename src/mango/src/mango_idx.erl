@@ -19,7 +19,6 @@
 
 -export([
     list/1,
-    recover/1,
 
     new/2,
     validate_new/2,
@@ -50,49 +49,59 @@
 -include_lib("couch/include/couch_db.hrl").
 -include("mango.hrl").
 -include("mango_idx.hrl").
+-include_lib("couch_views/include/couch_views.hrl").
 
 
 list(Db) ->
-    {ok, Indexes} = ddoc_cache:open(db_to_name(Db), ?MODULE),
-    Indexes.
+    DDocs = couch_views_ddoc:get_mango_list(Db),
+    DbName = fabric2_db:name(Db),
+    Indexes = lists:foldl(fun(DDoc, Acc) ->
+        {Props} = couch_doc:to_json_obj(DDoc, []),
+
+        case proplists:get_value(<<"language">>, Props) == <<"query">> of
+            true ->
+                {ok, Mrst} = couch_mrview_util:ddoc_to_mrst(DbName, DDoc),
+
+                IsInteractive = couch_views_ddoc:is_interactive(DDoc),
+                BuildState = couch_views_fdb:get_build_status(Db, Mrst),
+
+                Idxs = lists:map(fun(Idx) ->
+                    Idx#idx{
+                        build_status = BuildState,
+                        interactive = IsInteractive
+                    }
+                end, from_ddoc(Db, DDoc)),
+                Acc ++ Idxs;
+            false ->
+                Acc
+        end
+
+    end, [], DDocs),
+    Indexes ++ special(Db).
 
 
 get_usable_indexes(Db, Selector, Opts) ->
     ExistingIndexes = mango_idx:list(Db),
-    if ExistingIndexes /= [] -> ok; true ->
-        ?MANGO_ERROR({no_usable_index, no_indexes_defined})
-    end,
-
-    FilteredIndexes = mango_cursor:maybe_filter_indexes_by_ddoc(ExistingIndexes, Opts),
-    if FilteredIndexes /= [] -> ok; true ->
-        ?MANGO_ERROR({no_usable_index, no_index_matching_name})
-    end,
+    GlobalIndexes = mango_cursor:remove_indexes_with_partial_filter_selector(
+            ExistingIndexes
+        ),
+    BuiltIndexes = remove_unbuilt_indexes(GlobalIndexes),
+    UserSpecifiedIndex = mango_cursor:maybe_filter_indexes_by_ddoc(ExistingIndexes, Opts),
+    UsableIndexes0 = lists:usort(BuiltIndexes ++ UserSpecifiedIndex),
 
     SortFields = get_sort_fields(Opts),
     UsableFilter = fun(I) -> is_usable(I, Selector, SortFields) end,
-    UsableIndexes0 = lists:filter(UsableFilter, FilteredIndexes),
 
-    case maybe_filter_by_sort_fields(UsableIndexes0, SortFields) of
-        {ok, SortIndexes} -> 
-            SortIndexes;
-        {error, no_usable_index} -> 
-            ?MANGO_ERROR({no_usable_index, missing_sort_index})
+    case lists:filter(UsableFilter, UsableIndexes0) of
+        [] ->
+            mango_sort_error(Db, Opts);
+        UsableIndexes ->
+            UsableIndexes
     end.
 
 
-recover(Db) ->
-    {ok, DDocs0} = mango_util:open_ddocs(Db),
-    Pred = fun({Props}) ->
-        case proplists:get_value(<<"language">>, Props) of
-            <<"query">> -> true;
-            _ -> false
-        end
-    end,
-    DDocs = lists:filter(Pred, DDocs0),
-    Special = special(Db),
-    {ok, Special ++ lists:flatmap(fun(Doc) ->
-        from_ddoc(Db, Doc)
-    end, DDocs)}.
+mango_sort_error(_Db, _Opts) ->
+    ?MANGO_ERROR({no_usable_index, missing_sort_index}).
 
 
 get_sort_fields(Opts) ->
@@ -101,31 +110,6 @@ get_sort_fields(Opts) ->
             mango_sort:fields(Sort);
         _ ->
             []
-    end.
-
-
-maybe_filter_by_sort_fields(Indexes, []) ->
-    {ok, Indexes};
-
-maybe_filter_by_sort_fields(Indexes, SortFields) ->
-    FilterFun = fun(Idx) ->
-        Cols = mango_idx:columns(Idx),
-        case {mango_idx:type(Idx), Cols} of
-            {_, all_fields} ->
-                true;
-            {<<"text">>, _} ->
-                sets:is_subset(sets:from_list(SortFields), sets:from_list(Cols));
-            {<<"json">>, _} ->
-                lists:prefix(SortFields, Cols);
-            {<<"special">>, _} ->
-                lists:prefix(SortFields, Cols)
-        end
-    end,
-    case lists:filter(FilterFun, Indexes) of
-        [] ->
-            {error, no_usable_index};
-        FilteredIndexes ->
-            {ok, FilteredIndexes}
     end.
 
 
@@ -187,16 +171,17 @@ delete(Filt, Db, Indexes, DelOpts) ->
     end.
 
 
-from_ddoc(Db, {Props}) ->
+from_ddoc(Db, #doc{id = DDocId} = DDoc) ->
+    {Props} = couch_doc:to_json_obj(DDoc, []),
     DbName = db_to_name(Db),
-    DDoc = proplists:get_value(<<"_id">>, Props),
+    DDocId = proplists:get_value(<<"_id">>, Props),
 
     case proplists:get_value(<<"language">>, Props) of
         <<"query">> -> ok;
         _ ->
             ?MANGO_ERROR(invalid_query_ddoc_language)
     end,
-    IdxMods = case module_loaded(dreyfus_index) of
+    IdxMods = case is_text_service_available() of
         true ->
             [mango_idx_view, mango_idx_text];
         false ->
@@ -206,7 +191,7 @@ from_ddoc(Db, {Props}) ->
     lists:map(fun(Idx) ->
         Idx#idx{
             dbname = DbName,
-            ddoc = DDoc
+            ddoc = DDocId
         }
     end, Idxs).
 
@@ -217,7 +202,8 @@ special(Db) ->
         name = <<"_all_docs">>,
         type = <<"special">>,
         def = all_docs,
-        opts = []
+        opts = [],
+        build_status = ?INDEX_READY
     },
     % Add one for _update_seq
     [AllDocs].
@@ -277,7 +263,7 @@ cursor_mod(#idx{type = <<"json">>}) ->
 cursor_mod(#idx{def = all_docs, type= <<"special">>}) ->
     mango_cursor_special;
 cursor_mod(#idx{type = <<"text">>}) ->
-    case module_loaded(dreyfus_index) of
+    case clouseau_rpc:connected() of
         true ->
             mango_cursor_text;
         false ->
@@ -290,7 +276,7 @@ idx_mod(#idx{type = <<"json">>}) ->
 idx_mod(#idx{type = <<"special">>}) ->
     mango_idx_special;
 idx_mod(#idx{type = <<"text">>}) ->
-    case module_loaded(dreyfus_index) of
+    case clouseau_rpc:connected() of
         true ->
             mango_idx_text;
         false ->
@@ -303,7 +289,7 @@ db_to_name(Name) when is_binary(Name) ->
 db_to_name(Name) when is_list(Name) ->
     iolist_to_binary(Name);
 db_to_name(Db) ->
-    couch_db:name(Db).
+    fabric2_db:name(Db).
 
 
 get_idx_def(Opts) ->
@@ -318,7 +304,7 @@ get_idx_def(Opts) ->
 get_idx_type(Opts) ->
     case proplists:get_value(type, Opts) of
         <<"json">> -> <<"json">>;
-        <<"text">> -> case module_loaded(dreyfus_index) of
+        <<"text">> -> case is_text_service_available() of
             true ->
                 <<"text">>;
             false ->
@@ -329,6 +315,11 @@ get_idx_type(Opts) ->
         BadType ->
             ?MANGO_ERROR({invalid_index_type, BadType})
     end.
+
+
+is_text_service_available() ->
+    erlang:function_exported(clouseau_rpc, connected, 0) andalso
+        clouseau_rpc:connected().
 
 
 get_idx_ddoc(Idx, Opts) ->
@@ -369,8 +360,6 @@ filter_opts([{name, _} | Rest]) ->
     filter_opts(Rest);
 filter_opts([{type, _} | Rest]) ->
     filter_opts(Rest);
-filter_opts([{w, _} | Rest]) ->
-    filter_opts(Rest);
 filter_opts([Opt | Rest]) ->
     [Opt | filter_opts(Rest)].
 
@@ -394,6 +383,17 @@ get_legacy_selector(Def) ->
         Selector -> Selector
     end.
 
+% remove any interactive indexes that are not built. If an index is not
+% interactive than we do not remove it as it will be built when queried
+remove_unbuilt_indexes(Indexes) ->
+    lists:filter(fun(Idx) ->
+        case Idx#idx.interactive of
+            true -> Idx#idx.build_status == ?INDEX_READY;
+            _ -> true
+        end
+    end, Indexes).
+
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -404,7 +404,9 @@ index(SelectorName, Selector) ->
            <<"Selected">>,<<"json">>,
            {[{<<"fields">>,{[{<<"location">>,<<"asc">>}]}},
              {SelectorName,{Selector}}]},
-           [{<<"def">>,{[{<<"fields">>,[<<"location">>]}]}}]
+           [{<<"def">>,{[{<<"fields">>,[<<"location">>]}]}}],
+           <<"ready">>,
+           false
     }.
 
 get_partial_filter_all_docs_test() ->

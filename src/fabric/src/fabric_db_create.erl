@@ -23,12 +23,13 @@
 go(DbName, Options) ->
     case validate_dbname(DbName, Options) of
     ok ->
+        couch_partition:validate_dbname(DbName, Options),
         case db_exists(DbName) of
         true ->
             {error, file_exists};
         false ->
             {Shards, Doc} = generate_shard_map(DbName, Options),
-            CreateShardResult = create_shard_files(Shards),
+            CreateShardResult = create_shard_files(Shards, Options),
             case CreateShardResult of
             enametoolong ->
                 {error, {database_name_too_long, DbName}};
@@ -64,12 +65,12 @@ generate_shard_map(DbName, Options) ->
         % the DB already exists, and may have a different Suffix
         ok;
     {not_found, _} ->
-        Doc = make_document(Shards, Suffix)
+        Doc = make_document(Shards, Suffix, Options)
     end,
     {Shards, Doc}.
 
-create_shard_files(Shards) ->
-    Workers = fabric_util:submit_jobs(Shards, create_db, []),
+create_shard_files(Shards, Options) ->
+    Workers = fabric_util:submit_jobs(Shards, create_db, [Options]),
     RexiMon = fabric_util:create_monitors(Shards),
     try fabric_util:recv(Workers, #shard.ref, fun handle_message/3, Workers) of
     {error, file_exists} ->
@@ -146,16 +147,16 @@ maybe_stop(W, Counters) ->
         {ok, {W, Counters}};
     false ->
         case lists:sum([1 || {_, ok} <- Counters]) of
-        W ->
+        NumOk when NumOk >= (W div 2 +1) ->
             {stop, ok};
-        NumOk when NumOk >= (W div 2 + 1) ->
+        NumOk when NumOk > 0 ->
             {stop, accepted};
         _ ->
             {error, internal_server_error}
         end
     end.
 
-make_document([#shard{dbname=DbName}|_] = Shards, Suffix) ->
+make_document([#shard{dbname=DbName}|_] = Shards, Suffix, Options) ->
     {RawOut, ByNodeOut, ByRangeOut} =
     lists:foldl(fun(#shard{node=N, range=[B,E]}, {Raw, ByNode, ByRange}) ->
         Range = ?l2b([couch_util:to_hex(<<B:32/integer>>), "-",
@@ -164,42 +165,64 @@ make_document([#shard{dbname=DbName}|_] = Shards, Suffix) ->
         {[[<<"add">>, Range, Node] | Raw], orddict:append(Node, Range, ByNode),
             orddict:append(Range, Node, ByRange)}
     end, {[], [], []}, Shards),
-    #doc{id=DbName, body = {[
-        {<<"shard_suffix">>, Suffix},
-        {<<"changelog">>, lists:sort(RawOut)},
-        {<<"by_node">>, {[{K,lists:sort(V)} || {K,V} <- ByNodeOut]}},
-        {<<"by_range">>, {[{K,lists:sort(V)} || {K,V} <- ByRangeOut]}}
-    ]}}.
+    EngineProp = case couch_util:get_value(engine, Options) of
+        E when is_binary(E) -> [{<<"engine">>, E}];
+        _ -> []
+    end,
+    DbProps = case couch_util:get_value(props, Options) of
+        Props when is_list(Props) -> [{<<"props">>, {Props}}];
+        _ -> []
+    end,
+    #doc{
+        id = DbName,
+        body = {[
+            {<<"shard_suffix">>, Suffix},
+            {<<"changelog">>, lists:sort(RawOut)},
+            {<<"by_node">>, {[{K,lists:sort(V)} || {K,V} <- ByNodeOut]}},
+            {<<"by_range">>, {[{K,lists:sort(V)} || {K,V} <- ByRangeOut]}}
+        ] ++ EngineProp ++ DbProps}
+    }.
 
 db_exists(DbName) -> is_list(catch mem3:shards(DbName)).
 
--ifdef(TEST).
--include_lib("eunit/include/eunit.hrl").
-
-db_exists_for_existing_db_test() ->
-    start_meck_(),
-    Mock = fun(DbName) when is_binary(DbName) ->
-        [#shard{dbname = DbName, range = [0,100]}]
-    end,
-    ok = meck:expect(mem3, shards, Mock),
-    ?assertEqual(true, db_exists(<<"foobar">>)),
-    ?assertEqual(true, meck:validate(mem3)),
-    stop_meck_().
-
-db_exists_for_missing_db_test() ->
-    start_meck_(),
-    Mock = fun(DbName) ->
-        erlang:error(database_does_not_exist, DbName)
-    end,
-    ok = meck:expect(mem3, shards, Mock),
-    ?assertEqual(false, db_exists(<<"foobar">>)),
-    ?assertEqual(false, meck:validate(mem3)),
-    stop_meck_().
-
-start_meck_() ->
-    ok = meck:new(mem3).
-
-stop_meck_() ->
-    ok = meck:unload(mem3).
-
--endif.
+%% -ifdef(TEST).
+%% -include_lib("eunit/include/eunit.hrl").
+%%
+%% db_exists_test_() ->
+%%     {
+%%         setup,
+%%         fun setup_all/0,
+%%         fun teardown_all/1,
+%%         [
+%%             fun db_exists_for_existing_db/0,
+%%             fun db_exists_for_missing_db/0
+%%         ]
+%%     }.
+%%
+%%
+%% setup_all() ->
+%%     meck:new(mem3).
+%%
+%%
+%% teardown_all(_) ->
+%%     meck:unload().
+%%
+%%
+%% db_exists_for_existing_db() ->
+%%     Mock = fun(DbName) when is_binary(DbName) ->
+%%         [#shard{dbname = DbName, range = [0,100]}]
+%%     end,
+%%     ok = meck:expect(mem3, shards, Mock),
+%%     ?assertEqual(true, db_exists(<<"foobar">>)),
+%%     ?assertEqual(true, meck:validate(mem3)).
+%%
+%%
+%% db_exists_for_missing_db() ->
+%%     Mock = fun(DbName) ->
+%%         erlang:error(database_does_not_exist, DbName)
+%%     end,
+%%     ok = meck:expect(mem3, shards, Mock),
+%%     ?assertEqual(false, db_exists(<<"foobar">>)),
+%%     ?assertEqual(false, meck:validate(mem3)).
+%%
+%% -endif.

@@ -18,15 +18,17 @@
 
 % DBs
 -export([all_dbs/0, all_dbs/1, create_db/1, create_db/2, delete_db/1,
-    delete_db/2, get_db_info/1, get_doc_count/1, set_revs_limit/3,
-    set_security/2, set_security/3, get_revs_limit/1, get_security/1,
-    get_security/2, get_all_security/1, get_all_security/2,
-    compact/1, compact/2]).
+    delete_db/2, get_db_info/1, get_doc_count/1, get_doc_count/2,
+    set_revs_limit/3, set_security/2, set_security/3,
+    get_revs_limit/1, get_security/1, get_security/2,
+    get_all_security/1, get_all_security/2,
+    get_purge_infos_limit/1, set_purge_infos_limit/3,
+    compact/1, compact/2, get_partition_info/2]).
 
 % Documents
 -export([open_doc/3, open_revs/4, get_doc_info/3, get_full_doc_info/3,
     get_missing_revs/2, get_missing_revs/3, update_doc/3, update_docs/3,
-    purge_docs/2, att_receiver/2]).
+    purge_docs/3, att_receiver/2]).
 
 % Views
 -export([all_docs/4, all_docs/5, changes/4, query_view/3, query_view/4,
@@ -34,7 +36,8 @@
 
 % miscellany
 -export([design_docs/1, reset_validation_funs/1, cleanup_index_files/0,
-    cleanup_index_files/1, cleanup_index_files_all_nodes/1, dbname/1]).
+    cleanup_index_files/1, cleanup_index_files_all_nodes/1, dbname/1,
+    inactive_index_files/1]).
 
 -include_lib("fabric/include/fabric.hrl").
 
@@ -84,13 +87,35 @@ all_dbs(Prefix) when is_list(Prefix) ->
 get_db_info(DbName) ->
     fabric_db_info:go(dbname(DbName)).
 
+%% @doc returns the size of a given partition
+-spec get_partition_info(dbname(), Partition::binary()) ->
+    {ok, [
+        {db_name, binary()} |
+        {partition, binary()} |
+        {doc_count, non_neg_integer()} |
+        {doc_del_count, non_neg_integer()} |
+        {sizes, json_obj()}
+    ]}.
+get_partition_info(DbName, Partition) ->
+    fabric_db_partition_info:go(dbname(DbName), Partition).
+
+
 %% @doc the number of docs in a database
--spec get_doc_count(dbname()) ->
-    {ok, non_neg_integer()} |
+%% @equiv get_doc_count(DbName, <<"_all_docs">>)
+get_doc_count(DbName) ->
+    get_doc_count(DbName, <<"_all_docs">>).
+
+%% @doc the number of design docs in a database
+-spec get_doc_count(dbname(), Namespace::binary()) ->
+    {ok, non_neg_integer() | null} |
     {error, atom()} |
     {error, atom(), any()}.
-get_doc_count(DbName) ->
-    fabric_db_doc_count:go(dbname(DbName)).
+get_doc_count(DbName, <<"_all_docs">>) ->
+    fabric_db_doc_count:go(dbname(DbName));
+get_doc_count(DbName, <<"_design">>) ->
+    fabric_design_doc_count:go(dbname(DbName));
+get_doc_count(_DbName, <<"_local">>) ->
+    {ok, null}.
 
 %% @equiv create_db(DbName, [])
 create_db(DbName) ->
@@ -136,6 +161,18 @@ set_security(DbName, SecObj) ->
 -spec set_security(dbname(), SecObj::json_obj(), [option()]) -> ok.
 set_security(DbName, SecObj, Options) ->
     fabric_db_meta:set_security(dbname(DbName), SecObj, opts(Options)).
+
+%% @doc sets the upper bound for the number of stored purge requests
+-spec set_purge_infos_limit(dbname(), pos_integer(), [option()]) -> ok.
+set_purge_infos_limit(DbName, Limit, Options)
+        when is_integer(Limit), Limit > 0 ->
+    fabric_db_meta:set_purge_infos_limit(dbname(DbName), Limit, opts(Options)).
+
+%% @doc retrieves the upper bound for the number of stored purge requests
+-spec get_purge_infos_limit(dbname()) -> pos_integer() | no_return().
+get_purge_infos_limit(DbName) ->
+    {ok, Db} = fabric_util:get_db(dbname(DbName), [?ADMIN_CTX]),
+    try couch_db:get_purge_infos_limit(Db) after catch couch_db:close(Db) end.
 
 get_security(DbName) ->
     get_security(DbName, [?ADMIN_CTX]).
@@ -247,37 +284,51 @@ update_doc(DbName, Doc, Options) ->
         throw(Error);
     {ok, []} ->
         % replication success
-        #doc{revs = {Pos, [RevId | _]}} = doc(Doc),
-        {ok, {Pos, RevId}}
+        #doc{revs = {Pos, [RevId | _]}} = doc(DbName, Doc),
+        {ok, {Pos, RevId}};
+    {error, [Error]} ->
+        throw(Error)
     end.
 
 %% @doc update a list of docs
 -spec update_docs(dbname(), [#doc{} | json_obj()], [option()]) ->
     {ok, any()} | any().
-update_docs(DbName, Docs, Options) ->
+update_docs(DbName, Docs0, Options) ->
     try
-        fabric_doc_update:go(dbname(DbName), docs(Docs), opts(Options)) of
+        Docs1 = docs(DbName, Docs0),
+        fabric_doc_update:go(dbname(DbName), Docs1, opts(Options)) of
         {ok, Results} ->
             {ok, Results};
         {accepted, Results} ->
             {accepted, Results};
+        {error, Error} ->
+            {error, Error};
         Error ->
             throw(Error)
     catch {aborted, PreCommitFailures} ->
         {aborted, PreCommitFailures}
     end.
 
-purge_docs(_DbName, _IdsRevs) ->
-    not_implemented.
+
+%% @doc purge revisions for a list '{Id, Revs}'
+%%      returns {ok, {PurgeSeq, Results}}
+-spec purge_docs(dbname(), [{docid(), [revision()]}], [option()]) ->
+    {ok, [{Health, [revision()]}] | {error, any()}} when
+    Health :: ok | accepted.
+purge_docs(DbName, IdsRevs, Options) when is_list(IdsRevs) ->
+    IdsRevs2 = [idrevs(IdRs) || IdRs <- IdsRevs],
+    fabric_doc_purge:go(dbname(DbName), IdsRevs2, opts(Options)).
+
 
 %% @doc spawns a process to upload attachment data and
-%%      returns a function that shards can use to communicate
-%%      with the spawned middleman process
+%%      returns a fabric attachment receiver context tuple
+%%      with the spawned middleman process, an empty binary,
+%%      or exits with an error tuple {Error, Arg}
 -spec att_receiver(#httpd{}, Length :: undefined | chunked | pos_integer() |
         {unknown_transfer_encoding, any()}) ->
-    function() | binary().
+    {fabric_attachment_receiver, pid(), chunked | pos_integer()} | binary().
 att_receiver(Req, Length) ->
-    fabric_doc_attachments:receiver(Req, Length).
+    fabric_doc_atts:receiver(Req, Length).
 
 %% @equiv all_docs(DbName, [], Callback, Acc0, QueryArgs)
 all_docs(DbName, Callback, Acc, QueryArgs) ->
@@ -342,20 +393,21 @@ query_view(Db, Options, GroupId, ViewName, Callback, Acc0, QueryArgs)
         when is_binary(GroupId) ->
     DbName = dbname(Db),
     {ok, DDoc} = ddoc_cache:open(DbName, <<"_design/", GroupId/binary>>),
-    query_view(DbName, Options, DDoc, ViewName, Callback, Acc0, QueryArgs);
-query_view(DbName, Options, DDoc, ViewName, Callback, Acc0, QueryArgs0) ->
-    Db = dbname(DbName), View = name(ViewName),
-    case fabric_util:is_users_db(Db) of
+    query_view(Db, Options, DDoc, ViewName, Callback, Acc0, QueryArgs);
+query_view(Db, Options, DDoc, ViewName, Callback, Acc0, QueryArgs0) ->
+    DbName = dbname(Db),
+    View = name(ViewName),
+    case fabric_util:is_users_db(DbName) of
     true ->
-        FakeDb = fabric_util:fake_db(Db, Options),
+        FakeDb = fabric_util:open_cluster_db(DbName, Options),
         couch_users_db:after_doc_read(DDoc, FakeDb);
     false ->
         ok
     end,
     {ok, #mrst{views=Views, language=Lang}} =
-        couch_mrview_util:ddoc_to_mrst(Db, DDoc),
+        couch_mrview_util:ddoc_to_mrst(DbName, DDoc),
     QueryArgs1 = couch_mrview_util:set_view_type(QueryArgs0, View, Views),
-    QueryArgs2 = couch_mrview_util:validate_args(QueryArgs1),
+    QueryArgs2 = fabric_util:validate_args(Db, DDoc, QueryArgs1),
     VInfo = couch_mrview_util:extract_view(Lang, QueryArgs2, View, Views),
     case is_reduce_view(QueryArgs2) of
         true ->
@@ -452,24 +504,33 @@ cleanup_index_files() ->
 %% @doc clean up index files for a specific db
 -spec cleanup_index_files(dbname()) -> ok.
 cleanup_index_files(DbName) ->
+    lists:foreach(fun(File) ->
+        file:delete(File)
+    end, inactive_index_files(DbName)).
+
+%% @doc inactive index files for a specific db
+-spec inactive_index_files(dbname()) -> ok.
+inactive_index_files(DbName) ->
     {ok, DesignDocs} = fabric:design_docs(DbName),
 
-    ActiveSigs = lists:map(fun(#doc{id = GroupId}) ->
+    ActiveSigs = maps:from_list(lists:map(fun(#doc{id = GroupId}) ->
         {ok, Info} = fabric:get_view_group_info(DbName, GroupId),
-        binary_to_list(couch_util:get_value(signature, Info))
-    end, [couch_doc:from_json_obj(DD) || DD <- DesignDocs]),
+        {binary_to_list(couch_util:get_value(signature, Info)), nil}
+    end, [couch_doc:from_json_obj(DD) || DD <- DesignDocs])),
 
-    FileList = filelib:wildcard([config:get("couchdb", "view_index_dir"),
-        "/.shards/*/", couch_util:to_list(dbname(DbName)), ".[0-9]*_design/mrview/*"]),
+    FileList = lists:flatmap(fun(#shard{name = ShardName}) ->
+        IndexDir = couch_index_util:index_dir(mrview, ShardName),
+        filelib:wildcard([IndexDir, "/*"])
+    end, mem3:local_shards(dbname(DbName))),
 
-    DeleteFiles = if ActiveSigs =:= [] -> FileList; true ->
-        {ok, RegExp} = re:compile([$(, string:join(ActiveSigs, "|"), $)]),
+    if ActiveSigs =:= [] -> FileList; true ->
+        %% <sig>.view and <sig>.compact.view where <sig> is in ActiveSigs
+        %% will be excluded from FileList because they are active view
+        %% files and should not be deleted.
         lists:filter(fun(FilePath) ->
-            re:run(FilePath, RegExp, [{capture, none}]) == nomatch
+            not maps:is_key(get_view_sig_from_filename(FilePath), ActiveSigs)
         end, FileList)
-    end,
-    [file:delete(File) || File <- DeleteFiles],
-    ok.
+    end.
 
 %% @doc clean up index files for a specific db on all nodes
 -spec cleanup_index_files_all_nodes(dbname()) -> [reference()].
@@ -498,16 +559,25 @@ docid(DocId) when is_list(DocId) ->
 docid(DocId) ->
     DocId.
 
-docs(Docs) when is_list(Docs) ->
-    [doc(D) || D <- Docs];
-docs(Docs) ->
+docs(Db, Docs) when is_list(Docs) ->
+    [doc(Db, D) || D <- Docs];
+docs(_Db, Docs) ->
     erlang:error({illegal_docs_list, Docs}).
 
-doc(#doc{} = Doc) ->
+doc(_Db, #doc{} = Doc) ->
     Doc;
-doc({_} = Doc) ->
-    couch_doc:from_json_obj_validate(Doc);
-doc(Doc) ->
+doc(Db0, {_} = Doc) ->
+    Db = case couch_db:is_db(Db0) of
+        true ->
+            Db0;
+        false ->
+            Shard = hd(mem3:shards(Db0)),
+            Props = couch_util:get_value(props, Shard#shard.opts, []),
+            {ok, Db1} = couch_db:clustered_db(Db0, [{props, Props}]),
+            Db1
+    end,
+    couch_db:doc_from_json_obj_validate(Db, Doc);
+doc(_Db, Doc) ->
     erlang:error({illegal_doc_format, Doc}).
 
 design_doc(#doc{} = DDoc) ->
@@ -594,3 +664,57 @@ kl_to_record(KeyList,RecName) ->
 
 set_namespace(NS, #mrargs{extra = Extra} = Args) ->
     Args#mrargs{extra = [{namespace, NS} | Extra]}.
+
+get_view_sig_from_filename(FilePath) ->
+    filename:basename(filename:basename(FilePath, ".view"), ".compact").
+
+%% -ifdef(TEST).
+%% -include_lib("eunit/include/eunit.hrl").
+%%
+%% update_doc_test_() ->
+%%     {
+%%         "Update doc tests", {
+%%             setup, fun setup/0, fun teardown/1,
+%%             fun(Ctx) -> [
+%%                 should_throw_conflict(Ctx)
+%%             ] end
+%%         }
+%%     }.
+%%
+%% should_throw_conflict(Doc) ->
+%%     ?_test(begin
+%%         ?assertThrow(conflict, update_doc(<<"test-db">>, Doc, []))
+%%     end).
+%%
+%%
+%% setup() ->
+%%     Doc = #doc{
+%%         id = <<"test_doc">>,
+%%         revs = {3, [<<5,68,252,180,43,161,216,223,26,119,71,219,212,229,
+%%             159,113>>]},
+%%         body = {[{<<"foo">>,<<"asdf">>},{<<"author">>,<<"tom">>}]},
+%%         atts = [], deleted = false, meta = []
+%%     },
+%%     ok = application:ensure_started(config),
+%%     ok = meck:expect(mem3, shards, fun(_, _) -> [] end),
+%%     ok = meck:expect(mem3, quorum, fun(_) -> 1 end),
+%%     ok = meck:expect(rexi, cast, fun(_, _) -> ok end),
+%%     ok = meck:expect(rexi_utils, recv,
+%%         fun(_, _, _, _, _, _) ->
+%%             {ok, {error, [{Doc, conflict}]}}
+%%         end),
+%%     ok = meck:expect(couch_util, reorder_results,
+%%         fun(_, [{_, Res}]) ->
+%%             [Res]
+%%         end),
+%%     ok = meck:expect(fabric_util, create_monitors, fun(_) -> ok end),
+%%     ok = meck:expect(rexi_monitor, stop, fun(_) -> ok end),
+%%     Doc.
+%%
+%%
+%% teardown(_) ->
+%%     meck:unload(),
+%%     ok = application:stop(config).
+%%
+%%
+%% -endif.

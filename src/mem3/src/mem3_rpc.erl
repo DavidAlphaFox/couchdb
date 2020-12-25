@@ -19,15 +19,31 @@
     find_common_seq/4,
     get_missing_revs/4,
     update_docs/4,
+    pull_replication/1,
     load_checkpoint/4,
-    save_checkpoint/6
+    load_checkpoint/5,
+    save_checkpoint/6,
+
+    load_purge_infos/4,
+    save_purge_checkpoint/4,
+    purge_docs/4,
+
+    replicate/4
 ]).
 
 % Private RPC callbacks
 -export([
     find_common_seq_rpc/3,
     load_checkpoint_rpc/3,
-    save_checkpoint_rpc/5
+    pull_replication_rpc/1,
+    load_checkpoint_rpc/4,
+    save_checkpoint_rpc/5,
+
+    load_purge_infos_rpc/3,
+    save_purge_checkpoint_rpc/3,
+
+    replicate_rpc/2
+
 ]).
 
 
@@ -35,12 +51,31 @@
 -include_lib("couch/include/couch_db.hrl").
 
 
+-define(BATCH_SIZE, 1000).
+-define(REXI_CALL_TIMEOUT_MSEC, 600000).
+
+
+% "Pull" is a bit of a misnomer here, as what we're actually doing is
+% issuing an RPC request and telling the remote node to push updates to
+% us. This lets us reuse all of the battle-tested machinery of mem3_rpc.
+pull_replication(Seed) ->
+    rexi_call(Seed, {mem3_rpc, pull_replication_rpc, [node()]}).
+
 get_missing_revs(Node, DbName, IdsRevs, Options) ->
     rexi_call(Node, {fabric_rpc, get_missing_revs, [DbName, IdsRevs, Options]}).
 
 
 update_docs(Node, DbName, Docs, Options) ->
     rexi_call(Node, {fabric_rpc, update_docs, [DbName, Docs, Options]}).
+
+load_checkpoint(Node, DbName, SourceNode, SourceUUID, <<>>) ->
+    % Upgrade clause for a mixed cluster for old nodes that don't have
+    % load_checkpoint_rpc/4 yet. FilterHash is currently not
+    % used and so defaults to <<>> everywhere
+    load_checkpoint(Node, DbName, SourceNode, SourceUUID);
+load_checkpoint(Node, DbName, SourceNode, SourceUUID, FilterHash) ->
+    Args = [DbName, SourceNode, SourceUUID, FilterHash],
+    rexi_call(Node, {mem3_rpc, load_checkpoint_rpc, Args}).
 
 
 load_checkpoint(Node, DbName, SourceNode, SourceUUID) ->
@@ -58,12 +93,36 @@ find_common_seq(Node, DbName, SourceUUID, SourceEpochs) ->
     rexi_call(Node, {mem3_rpc, find_common_seq_rpc, Args}).
 
 
+load_purge_infos(Node, DbName, SourceUUID, Count) ->
+    Args = [DbName, SourceUUID, Count],
+    rexi_call(Node, {mem3_rpc, load_purge_infos_rpc, Args}).
+
+
+save_purge_checkpoint(Node, DbName, PurgeDocId, Body) ->
+    Args = [DbName, PurgeDocId, Body],
+    rexi_call(Node, {mem3_rpc, save_purge_checkpoint_rpc, Args}).
+
+
+purge_docs(Node, DbName, PurgeInfos, Options) ->
+    rexi_call(Node, {fabric_rpc, purge_docs, [DbName, PurgeInfos, Options]}).
+
+
+replicate(Source, Target, DbName, Timeout)
+        when is_atom(Source), is_atom(Target), is_binary(DbName) ->
+    Args = [DbName, Target],
+    rexi_call(Source, {mem3_rpc, replicate_rpc, Args}, Timeout).
+
+
 load_checkpoint_rpc(DbName, SourceNode, SourceUUID) ->
+    load_checkpoint_rpc(DbName, SourceNode, SourceUUID, <<>>).
+
+
+load_checkpoint_rpc(DbName, SourceNode, SourceUUID, FilterHash) ->
     erlang:put(io_priority, {internal_repl, DbName}),
     case get_or_create_db(DbName, [?ADMIN_CTX]) of
     {ok, Db} ->
         TargetUUID = couch_db:get_uuid(Db),
-        NewId = mem3_rep:make_local_id(SourceUUID, TargetUUID),
+        NewId = mem3_rep:make_local_id(SourceUUID, TargetUUID, FilterHash),
         case couch_db:open_doc(Db, NewId, []) of
         {ok, Doc} ->
             rexi:reply({ok, {NewId, Doc}});
@@ -126,6 +185,68 @@ find_common_seq_rpc(DbName, SourceUUID, SourceEpochs) ->
     Error ->
         rexi:reply(Error)
     end.
+
+pull_replication_rpc(Target) ->
+    Dbs = mem3_sync:local_dbs(),
+    Opts = [{batch_size, 1000}, {batch_count, 50}],
+    Repl = fun(Db) -> {Db, mem3_rep:go(Db, Target, Opts)} end,
+    rexi:reply({ok, lists:map(Repl, Dbs)}).
+
+
+load_purge_infos_rpc(DbName, SrcUUID, BatchSize) ->
+    erlang:put(io_priority, {internal_repl, DbName}),
+    case get_or_create_db(DbName, [?ADMIN_CTX]) of
+        {ok, Db} ->
+            TgtUUID = couch_db:get_uuid(Db),
+            PurgeDocId = mem3_rep:make_purge_id(SrcUUID, TgtUUID),
+            StartSeq = case couch_db:open_doc(Db, PurgeDocId, []) of
+                {ok, #doc{body = {Props}}} ->
+                    couch_util:get_value(<<"purge_seq">>, Props);
+                {not_found, _} ->
+                    Oldest = couch_db:get_oldest_purge_seq(Db),
+                    erlang:max(0, Oldest - 1)
+            end,
+            FoldFun = fun({PSeq, UUID, Id, Revs}, {Count, Infos, _}) ->
+                NewCount = Count + length(Revs),
+                NewInfos = [{UUID, Id, Revs} | Infos],
+                Status = if NewCount < BatchSize -> ok; true -> stop end,
+                {Status, {NewCount, NewInfos, PSeq}}
+            end,
+            InitAcc = {0, [], StartSeq},
+            {ok, {_, PurgeInfos, ThroughSeq}} =
+                    couch_db:fold_purge_infos(Db, StartSeq, FoldFun, InitAcc),
+            PurgeSeq = couch_db:get_purge_seq(Db),
+            Remaining = PurgeSeq - ThroughSeq,
+            rexi:reply({ok, {PurgeDocId, PurgeInfos, ThroughSeq, Remaining}});
+        Else ->
+            rexi:reply(Else)
+    end.
+
+
+save_purge_checkpoint_rpc(DbName, PurgeDocId, Body) ->
+    erlang:put(io_priority, {internal_repl, DbName}),
+    case get_or_create_db(DbName, [?ADMIN_CTX]) of
+        {ok, Db} ->
+            Doc = #doc{id = PurgeDocId, body = Body},
+            Resp = try couch_db:update_doc(Db, Doc, []) of
+                Resp0 -> Resp0
+            catch T:R ->
+                {T, R}
+            end,
+            rexi:reply(Resp);
+        Error ->
+            rexi:reply(Error)
+    end.
+
+
+replicate_rpc(DbName, Target) ->
+    rexi:reply(try
+        Opts = [{batch_size, ?BATCH_SIZE}, {batch_count, all}],
+        {ok, mem3_rep:go(DbName, Target, Opts)}
+    catch
+        Tag:Error ->
+            {Tag, Error}
+    end).
 
 
 %% @doc Return the sequence where two files with the same UUID diverged.
@@ -258,6 +379,10 @@ find_bucket(NewSeq, CurSeq, Bucket) ->
 
 
 rexi_call(Node, MFA) ->
+    rexi_call(Node, MFA, ?REXI_CALL_TIMEOUT_MSEC).
+
+
+rexi_call(Node, MFA, Timeout) ->
     Mon = rexi_monitor:start([rexi_utils:server_pid(Node)]),
     Ref = rexi:cast(Node, self(), MFA, [sync]),
     try
@@ -267,7 +392,7 @@ rexi_call(Node, MFA) ->
             erlang:error(Error);
         {rexi_DOWN, Mon, _, Reason} ->
             erlang:error({rexi_DOWN, {Node, Reason}})
-        after 600000 ->
+        after Timeout ->
             erlang:error(timeout)
         end
     after
@@ -276,7 +401,7 @@ rexi_call(Node, MFA) ->
 
 
 get_or_create_db(DbName, Options) ->
-    couch_db:open_int(DbName, [{create_if_missing, true} | Options]).
+    mem3_util:get_or_create_db(DbName, Options).
 
 
 -ifdef(TEST).

@@ -12,7 +12,8 @@
 
 -module(chttpd_external).
 
--export([handle_external_req/2, handle_external_req/3]).
+-compile(tuple_calls).
+
 -export([send_external_response/2]).
 -export([json_req_obj_fields/0, json_req_obj/2, json_req_obj/3, json_req_obj/4]).
 -export([default_or_content_type/2, parse_external_response/1]).
@@ -20,41 +21,6 @@
 -import(chttpd,[send_error/4]).
 
 -include_lib("couch/include/couch_db.hrl").
-
-% handle_external_req/2
-% for the old type of config usage:
-% _external = {chttpd_external, handle_external_req}
-% with urls like
-% /db/_external/action/design/name
-handle_external_req(#httpd{
-                        path_parts=[_DbName, _External, UrlName | _Path]
-                    }=HttpReq, Db) ->
-    process_external_req(HttpReq, Db, UrlName);
-handle_external_req(#httpd{path_parts=[_, _]}=Req, _Db) ->
-    send_error(Req, 404, <<"external_server_error">>, <<"No server name specified.">>);
-handle_external_req(Req, _) ->
-    send_error(Req, 404, <<"external_server_error">>, <<"Broken assumption">>).
-
-% handle_external_req/3
-% for this type of config usage:
-% _action = {chttpd_external, handle_external_req, <<"action">>}
-% with urls like
-% /db/_action/design/name
-handle_external_req(HttpReq, Db, Name) ->
-    process_external_req(HttpReq, Db, Name).
-
-process_external_req(HttpReq, Db, Name) ->
-
-    Response = couch_external_manager:execute(binary_to_list(Name),
-        json_req_obj(HttpReq, Db)),
-
-    case Response of
-    {unknown_external_server, Msg} ->
-        send_error(HttpReq, 404, <<"external_server_error">>, Msg);
-    _ ->
-        send_external_response(HttpReq, Response)
-    end.
-
 
 json_req_obj(Req, Db) ->
     json_req_obj(Req, Db, null).
@@ -72,7 +38,7 @@ json_req_obj_fields() ->
      <<"peer">>, <<"form">>, <<"cookie">>, <<"userCtx">>, <<"secObj">>].
 
 json_req_obj_field(<<"info">>, #httpd{}, Db, _DocId) ->
-    {ok, Info} = get_db_info(Db),
+    {ok, Info} = fabric2_db:get_db_info(Db),
     {Info};
 json_req_obj_field(<<"uuid">>, #httpd{}, _Db, _DocId) ->
     couch_uuids:new();
@@ -115,27 +81,18 @@ json_req_obj_field(<<"form">>, #httpd{mochi_req=Req, method=Method}=HttpReq, Db,
 json_req_obj_field(<<"cookie">>, #httpd{mochi_req=Req}, _Db, _DocId) ->
     to_json_terms(Req:parse_cookie());
 json_req_obj_field(<<"userCtx">>, #httpd{}, Db, _DocId) ->
-    couch_util:json_user_ctx(Db);
-json_req_obj_field(<<"secObj">>, #httpd{user_ctx=UserCtx}, Db, _DocId) ->
-    get_db_security(Db, UserCtx).
+    json_user_ctx(Db);
+json_req_obj_field(<<"secObj">>, #httpd{user_ctx = #user_ctx{}}, Db, _DocId) ->
+    fabric2_db:get_security(Db).
 
 
-get_db_info(Db) ->
-    case couch_db:is_clustered(Db) of
-        true ->
-            fabric:get_db_info(Db);
-        false ->
-            couch_db:get_db_info(Db)
-    end.
-
-
-get_db_security(Db, #user_ctx{}) ->
-    case couch_db:is_clustered(Db) of
-        true ->
-            fabric:get_security(Db);
-        false ->
-            couch_db:get_security(Db)
-    end.
+json_user_ctx(Db) ->
+    Ctx = fabric2_db:get_user_ctx(Db),
+    {[
+        {<<"db">>, fabric2_db:name(Db)},
+        {<<"name">>, Ctx#user_ctx.name},
+        {<<"roles">>, Ctx#user_ctx.roles}
+    ]}.
 
 
 to_json_terms(Data) ->

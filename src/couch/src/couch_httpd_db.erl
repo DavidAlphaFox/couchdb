@@ -11,6 +11,9 @@
 % the License.
 
 -module(couch_httpd_db).
+
+-compile(tuple_calls).
+
 -include_lib("couch/include/couch_db.hrl").
 
 -export([handle_request/1, handle_compact_req/2, handle_design_req/2,
@@ -196,9 +199,15 @@ handle_design_req(#httpd{
     false -> ok
     end,
 
-    % load ddoc
+    % maybe load ddoc through fabric
     DesignId = <<"_design/", DesignName/binary>>,
-    DDoc = couch_httpd_db:couch_doc_open(Db, DesignId, nil, [ejson_body]),
+    case couch_httpd_db:couch_doc_open(Db, DesignId, nil, [ejson_body]) of
+        not_found ->
+            DbName = mem3:dbname(couch_db:name(Db)),
+            {ok, DDoc} = fabric:open_doc(DbName, DesignId, [?ADMIN_CTX]);
+        DDoc ->
+            ok
+    end,
     Handler = couch_util:dict_find(Action, DesignUrlHandlers, fun(_, _, _) ->
         throw({not_found, <<"missing handler: ", Action/binary>>})
     end),
@@ -216,8 +225,14 @@ handle_design_info_req(#httpd{
     couch_mrview_http:handle_info_req(Req, Db, DDoc).
 
 create_db_req(#httpd{user_ctx=UserCtx}=Req, DbName) ->
-    ok = couch_httpd:verify_is_server_admin(Req), %% 验证是否是管理员
-    case couch_server:create(DbName, [{user_ctx, UserCtx}]) of
+    ok = couch_httpd:verify_is_server_admin(Req),
+    Engine = case couch_httpd:qs_value(Req, "engine") of
+        EngineStr when is_list(EngineStr) ->
+            [{engine, iolist_to_binary(EngineStr)}];
+        _ ->
+            []
+    end,
+    case couch_server:create(DbName, [{user_ctx, UserCtx}] ++ Engine) of
     {ok, Db} ->
         couch_db:close(Db),
         DbUrl = absolute_uri(Req, "/" ++ couch_util:url_encode(DbName)),
@@ -257,8 +272,7 @@ db_req(#httpd{method='GET',path_parts=[_DbName]}=Req, Db) ->
 
 db_req(#httpd{method='POST',path_parts=[_DbName]}=Req, Db) ->
     couch_httpd:validate_ctype(Req, "application/json"),
-    DbName = couch_db:name(Db),
-    Doc = couch_doc:from_json_obj_validate(couch_httpd:json_body(Req), DbName),
+    Doc = couch_db:doc_from_json_obj_validate(Db, couch_httpd:json_body(Req)),
     validate_attachment_names(Doc),
     Doc2 = case Doc#doc.id of
         <<"">> ->
@@ -275,23 +289,7 @@ db_req(#httpd{path_parts=[_DbName]}=Req, _Db) ->
 db_req(#httpd{method='POST',path_parts=[_,<<"_ensure_full_commit">>]}=Req, Db) ->
     couch_httpd:validate_ctype(Req, "application/json"),
     _ = couch_httpd:body(Req),
-    UpdateSeq = couch_db:get_update_seq(Db),
-    CommittedSeq = couch_db:get_committed_update_seq(Db),
-    {ok, StartTime} =
-    case couch_httpd:qs_value(Req, "seq") of
-    undefined ->
-        couch_db:ensure_full_commit(Db);
-    RequiredStr ->
-        RequiredSeq = list_to_integer(RequiredStr),
-        if RequiredSeq > UpdateSeq ->
-            throw({bad_request,
-                "can't do a full commit ahead of current update_seq"});
-        RequiredSeq > CommittedSeq ->
-            couch_db:ensure_full_commit(Db);
-        true ->
-            {ok, couch_db:get_instance_start_time(Db)}
-        end
-    end,
+    StartTime = couch_db:get_instance_start_time(Db),
     send_json(Req, 201, {[
         {ok, true},
         {instance_start_time, StartTime}
@@ -304,7 +302,6 @@ db_req(#httpd{method='POST',path_parts=[_,<<"_bulk_docs">>]}=Req, Db) ->
     couch_stats:increment_counter([couchdb, httpd, bulk_requests]),
     couch_httpd:validate_ctype(Req, "application/json"),
     {JsonProps} = couch_httpd:json_body_obj(Req),
-    DbName = couch_db:name(Db),
     case couch_util:get_value(<<"docs">>, JsonProps) of
     undefined ->
         send_error(Req, 400, <<"bad_request">>, <<"Missing JSON list of 'docs'">>);
@@ -322,7 +319,7 @@ db_req(#httpd{method='POST',path_parts=[_,<<"_bulk_docs">>]}=Req, Db) ->
         true ->
             Docs = lists:map(
                 fun({ObjProps} = JsonObj) ->
-                    Doc = couch_doc:from_json_obj_validate(JsonObj, DbName),
+                    Doc = couch_db:doc_from_json_obj_validate(Db, JsonObj),
                     validate_attachment_names(Doc),
                     Id = case Doc#doc.id of
                         <<>> -> couch_uuids:new();
@@ -356,7 +353,7 @@ db_req(#httpd{method='POST',path_parts=[_,<<"_bulk_docs">>]}=Req, Db) ->
             end;
         false ->
             Docs = lists:map(fun(JsonObj) ->
-                    Doc = couch_doc:from_json_obj_validate(JsonObj, DbName),
+                    Doc = couch_db:doc_from_json_obj_validate(Db, JsonObj),
                     validate_attachment_names(Doc),
                     Doc
                 end, DocsArray),
@@ -370,17 +367,22 @@ db_req(#httpd{path_parts=[_,<<"_bulk_docs">>]}=Req, _Db) ->
     send_method_not_allowed(Req, "POST");
 
 db_req(#httpd{method='POST',path_parts=[_,<<"_purge">>]}=Req, Db) ->
+    couch_stats:increment_counter([couchdb, httpd, purge_requests]),
     couch_httpd:validate_ctype(Req, "application/json"),
-    {IdsRevs} = couch_httpd:json_body_obj(Req),
-    IdsRevs2 = [{Id, couch_doc:parse_revs(Revs)} || {Id, Revs} <- IdsRevs],
+    {IdRevs} = couch_httpd:json_body_obj(Req),
+    PurgeReqs = lists:map(fun({Id, JsonRevs}) ->
+        {couch_uuids:new(), Id, couch_doc:parse_revs(JsonRevs)}
+    end, IdRevs),
 
-    case couch_db:purge_docs(Db, IdsRevs2) of
-    {ok, PurgeSeq, PurgedIdsRevs} ->
-        PurgedIdsRevs2 = [{Id, couch_doc:revs_to_strs(Revs)} || {Id, Revs} <- PurgedIdsRevs],
-        send_json(Req, 200, {[{<<"purge_seq">>, PurgeSeq}, {<<"purged">>, {PurgedIdsRevs2}}]});
-    Error ->
-        throw(Error)
-    end;
+    {ok, Replies} = couch_db:purge_docs(Db, PurgeReqs),
+
+    Results = lists:zipwith(fun({Id, _}, {ok, Reply}) ->
+        {Id, couch_doc:revs_to_strs(Reply)}
+    end, IdRevs, Replies),
+
+    {ok, Db2} = couch_db:reopen(Db),
+    PurgeSeq = couch_db:get_purge_seq(Db2),
+    send_json(Req, 200, {[{purge_seq, PurgeSeq}, {purged, {Results}}]});
 
 db_req(#httpd{path_parts=[_,<<"_purge">>]}=Req, _Db) ->
     send_method_not_allowed(Req, "POST");
@@ -488,17 +490,15 @@ db_req(#httpd{path_parts=[_, DocId | FileNameParts]}=Req, Db) ->
 db_doc_req(#httpd{method='DELETE'}=Req, Db, DocId) ->
     % check for the existence of the doc to handle the 404 case.
     couch_doc_open(Db, DocId, nil, []),
-    DbName = couch_db:name(Db),
     case couch_httpd:qs_value(Req, "rev") of
     undefined ->
-        update_doc(Req, Db, DocId,
-                couch_doc_from_req(Req, DocId, {[{<<"_deleted">>,true}]},
-                    DbName));
+        JsonObj = {[{<<"_deleted">>,true}]},
+        Doc = couch_doc_from_req(Req, Db, DocId, JsonObj),
+        update_doc(Req, Db, DocId, Doc);
     Rev ->
-        update_doc(Req, Db, DocId,
-                couch_doc_from_req(Req, DocId,
-                    {[{<<"_rev">>, ?l2b(Rev)},{<<"_deleted">>,true}]},
-                    DbName))
+        JsonObj = {[{<<"_rev">>, ?l2b(Rev)},{<<"_deleted">>,true}]},
+        Doc = couch_doc_from_req(Req, Db, DocId, JsonObj),
+        update_doc(Req, Db, DocId, Doc)
     end;
 
 db_doc_req(#httpd{method = 'GET', mochi_req = MochiReq} = Req, Db, DocId) ->
@@ -551,8 +551,7 @@ db_doc_req(#httpd{method = 'GET', mochi_req = MochiReq} = Req, Db, DocId) ->
 
 db_doc_req(#httpd{method='POST'}=Req, Db, DocId) ->
     couch_httpd:validate_referer(Req),
-    DbName = couch_db:name(Db),
-    couch_doc:validate_docid(DocId, DbName),
+    couch_db:validate_docid(Db, DocId),
     couch_httpd:validate_ctype(Req, "multipart/form-data"),
     Form = couch_httpd:parse_form(Req),
     case couch_util:get_value("_doc", Form) of
@@ -560,7 +559,7 @@ db_doc_req(#httpd{method='POST'}=Req, Db, DocId) ->
         Rev = couch_doc:parse_rev(couch_util:get_value("_rev", Form)),
         {ok, [{ok, Doc}]} = couch_db:open_doc_revs(Db, DocId, [Rev], []);
     Json ->
-        Doc = couch_doc_from_req(Req, DocId, ?JSON_DECODE(Json), DbName)
+        Doc = couch_doc_from_req(Req, Db, DocId, ?JSON_DECODE(Json))
     end,
     UpdatedAtts = [
         couch_att:new([
@@ -586,15 +585,14 @@ db_doc_req(#httpd{method='POST'}=Req, Db, DocId) ->
     update_doc(Req, Db, DocId, NewDoc);
 
 db_doc_req(#httpd{method='PUT'}=Req, Db, DocId) ->
-    DbName = couch_db:name(Db),
-    couch_doc:validate_docid(DocId, DbName),
+    couch_db:validate_docid(Db, DocId),
 
     case couch_util:to_list(couch_httpd:header_value(Req, "Content-Type")) of
     ("multipart/related;" ++ _) = ContentType ->
         couch_httpd:check_max_request_length(Req),
         {ok, Doc0, WaitFun, Parser} = couch_doc:doc_from_multi_part_stream(
             ContentType, fun() -> receive_request_data(Req) end),
-        Doc = couch_doc_from_req(Req, DocId, Doc0, DbName),
+        Doc = couch_doc_from_req(Req, Db, DocId, Doc0),
         try
             Result = update_doc(Req, Db, DocId, Doc),
             WaitFun(),
@@ -606,7 +604,7 @@ db_doc_req(#httpd{method='PUT'}=Req, Db, DocId) ->
         end;
     _Else ->
         Body = couch_httpd:json_body(Req),
-        Doc = couch_doc_from_req(Req, DocId, Body, DbName),
+        Doc = couch_doc_from_req(Req, Db, DocId, Body),
         update_doc(Req, Db, DocId, Doc)
     end;
 
@@ -616,7 +614,8 @@ db_doc_req(#httpd{method='COPY'}=Req, Db, SourceDocId) ->
         missing_rev -> nil;
         Rev -> Rev
     end,
-    {TargetDocId, TargetRevs} = parse_copy_destination_header(Req),
+    {TargetDocId0, TargetRevs} = parse_copy_destination_header(Req),
+    TargetDocId = list_to_binary(mochiweb_util:unquote(TargetDocId0)),
     % open old doc
     Doc = couch_doc_open(Db, SourceDocId, SourceRev, []),
     % save new doc
@@ -790,7 +789,7 @@ update_doc(Req, Db, DocId, #doc{deleted=Deleted}=Doc, Headers, UpdateType) ->
                 {rev, NewRevStr}]})
     end.
 
-couch_doc_from_req(Req, DocId, #doc{revs=Revs}=Doc, _) ->
+couch_doc_from_req(Req, _Db, DocId, #doc{revs=Revs}=Doc) ->
     validate_attachment_names(Doc),
     Rev = case couch_httpd:qs_value(Req, "rev") of
     undefined ->
@@ -817,9 +816,9 @@ couch_doc_from_req(Req, DocId, #doc{revs=Revs}=Doc, _) ->
         end
     end,
     Doc#doc{id=DocId, revs=Revs2};
-couch_doc_from_req(Req, DocId, Json, DbName) ->
-    couch_doc_from_req(Req, DocId,
-        couch_doc:from_json_obj_validate(Json, DbName), DbName).
+couch_doc_from_req(Req, Db, DocId, Json) ->
+    Doc = couch_db:doc_from_json_obj_validate(Db, Json),
+    couch_doc_from_req(Req, Db, DocId, Doc).
 
 % Useful for debugging
 % couch_doc_open(Db, DocId) ->
@@ -1027,7 +1026,7 @@ db_attachment_req(#httpd{method=Method,mochi_req=MochiReq}=Req, Db, DocId, FileN
                 % check for the existence of the doc to handle the 404 case.
                 couch_doc_open(Db, DocId, nil, [])
             end,
-            couch_doc:validate_docid(DocId, couch_db:name(Db)),
+            couch_db:validate_docid(Db, DocId),
             #doc{id=DocId};
         Rev ->
             case couch_db:open_doc_revs(Db, DocId, [Rev], []) of

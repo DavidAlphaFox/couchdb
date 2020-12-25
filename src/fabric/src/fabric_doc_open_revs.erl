@@ -29,6 +29,7 @@
     revs,
     latest,
     replies = [],
+    node_revs = [],
     repair = false
 }).
 
@@ -82,6 +83,7 @@ handle_message({ok, RawReplies}, Worker, State) ->
         worker_count = WorkerCount,
         workers = Workers,
         replies = PrevReplies,
+        node_revs = PrevNodeRevs,
         r = R,
         revs = Revs,
         latest = Latest,
@@ -92,7 +94,6 @@ handle_message({ok, RawReplies}, Worker, State) ->
     IsTree = Revs == all orelse Latest,
 
     % Do not count error replies when checking quorum
-
     RealReplyCount = ReplyCount + 1 - ReplyErrorCount,
     QuorumReplies = RealReplyCount >= R,
     {NewReplies, QuorumMet, Repair} = case IsTree of
@@ -102,10 +103,22 @@ handle_message({ok, RawReplies}, Worker, State) ->
             NumLeafs = couch_key_tree:count_leafs(PrevReplies),
             SameNumRevs = length(RawReplies) == NumLeafs,
             QMet = AllInternal andalso SameNumRevs andalso QuorumReplies,
-            {NewReplies0, QMet, Repair0};
+            % Don't set repair=true on the first reply
+            {NewReplies0, QMet, (ReplyCount > 0) and Repair0};
         false ->
             {NewReplies0, MinCount} = dict_replies(PrevReplies, RawReplies),
             {NewReplies0, MinCount >= R, false}
+    end,
+    NewNodeRevs = if Worker == nil -> PrevNodeRevs; true ->
+        IdRevs = lists:foldl(fun
+            ({ok, #doc{revs = {Pos, [Rev | _]}}}, Acc) ->
+                [{Pos, Rev} | Acc];
+            (_, Acc) ->
+                Acc
+        end, [], RawReplies),
+        if IdRevs == [] -> PrevNodeRevs; true ->
+            [{Worker#shard.node, IdRevs} | PrevNodeRevs]
+        end
     end,
 
     Complete = (ReplyCount =:= (WorkerCount - 1)),
@@ -117,6 +130,7 @@ handle_message({ok, RawReplies}, Worker, State) ->
                     DbName,
                     IsTree,
                     NewReplies,
+                    NewNodeRevs,
                     ReplyCount + 1,
                     InRepair orelse Repair
                 ),
@@ -124,6 +138,7 @@ handle_message({ok, RawReplies}, Worker, State) ->
         false ->
             {ok, State#state{
                 replies = NewReplies,
+                node_revs = NewNodeRevs,
                 reply_count = ReplyCount + 1,
                 workers = lists:delete(Worker, Workers),
                 repair = InRepair orelse Repair
@@ -180,7 +195,7 @@ dict_replies(Dict, [Reply | Rest]) ->
     dict_replies(NewDict, Rest).
 
 
-maybe_read_repair(Db, IsTree, Replies, ReplyCount, DoRepair) ->
+maybe_read_repair(Db, IsTree, Replies, NodeRevs, ReplyCount, DoRepair) ->
     Docs = case IsTree of
         true -> tree_repair_docs(Replies, DoRepair);
         false -> dict_repair_docs(Replies, ReplyCount)
@@ -189,7 +204,7 @@ maybe_read_repair(Db, IsTree, Replies, ReplyCount, DoRepair) ->
         [] ->
             ok;
         _ ->
-            erlang:spawn(fun() -> read_repair(Db, Docs) end)
+            erlang:spawn(fun() -> read_repair(Db, Docs, NodeRevs) end)
     end.
 
 
@@ -208,8 +223,9 @@ dict_repair_docs(Replies, ReplyCount) ->
     end.
 
 
-read_repair(Db, Docs) ->
-    Res = fabric:update_docs(Db, Docs, [replicated_changes, ?ADMIN_CTX]),
+read_repair(Db, Docs, NodeRevs) ->
+    Opts = [?ADMIN_CTX, replicated_changes, {read_repair, NodeRevs}],
+    Res = fabric:update_docs(Db, Docs, Opts),
     case Res of
         {ok, []} ->
             couch_stats:increment_counter([fabric, read_repairs, success]);
@@ -227,8 +243,7 @@ format_reply(true, Replies, _) ->
     tree_format_replies(Replies);
 
 format_reply(false, Replies, _) ->
-    Filtered = filter_reply(Replies),
-    dict_format_replies(Filtered).
+    dict_format_replies(Replies).
 
 
 tree_format_replies(RevTree) ->
@@ -244,302 +259,541 @@ tree_format_replies(RevTree) ->
 
 
 dict_format_replies(Dict) ->
-    lists:sort([Reply || {_, {Reply, _}} <- Dict]).
+    Replies0 = [Reply || {_, {Reply, _}} <- Dict],
 
-filter_reply(Replies) ->
-    AllFoundRevs = lists:foldl(fun
-        ({{{not_found, missing}, _}, _}, Acc) ->
-            Acc;
-        ({{_, {Pos, [Rev | _]}}, _}, Acc) ->
-            [{Pos, Rev} | Acc]
-    end, [], Replies),
-    %% keep not_found replies only for the revs that don't also have doc reply
-    lists:filter(fun
-        ({{{not_found, missing}, Rev}, _}) ->
-            not lists:member(Rev, AllFoundRevs);
-        (_) ->
-            true
-    end, Replies).
+    AllFoundRevs = lists:foldl(fun(Reply, Acc) ->
+        case Reply of
+            {ok, #doc{revs = {Pos, [RevId | _]}}} ->
+                [{Pos, RevId} | Acc];
+            _ ->
+                Acc
+        end
+    end, [], Replies0),
 
--ifdef(TEST).
--include_lib("eunit/include/eunit.hrl").
+    %% Drop any not_found replies for which we
+    %% found the revision on a different node.
+    Replies1 = lists:filter(fun(Reply) ->
+        case Reply of
+            {{not_found, missing}, Rev} ->
+                not lists:member(Rev, AllFoundRevs);
+            _ ->
+                true
+        end
+    end, Replies0),
 
-
-setup() ->
-    config:start_link([]),
-    meck:new([fabric, couch_stats, couch_log]),
-    meck:expect(fabric, update_docs, fun(_, _, _) -> {ok, nil} end),
-    meck:expect(couch_stats, increment_counter, fun(_) -> ok end),
-    meck:expect(couch_log, notice, fun(_, _) -> ok end).
+    % Remove replies with shorter revision
+    % paths for a given revision.
+    collapse_duplicate_revs(Replies1).
 
 
-teardown(_) ->
-    (catch meck:unload([fabric, couch_stats, couch_log])),
-    config:stop().
+collapse_duplicate_revs(Replies) ->
+    % The collapse logic requires that replies are
+    % sorted so that shorter rev paths are in
+    % the list just before longer lists.
+    %
+    % This somewhat implicitly relies on Erlang's
+    % sorting of [A, B] < [A, B, C] for all values
+    % of C.
+    collapse_duplicate_revs_int(lists:sort(Replies)).
 
 
-state0(Revs, Latest) ->
-    #state{
-        worker_count = 3,
-        workers = [w1, w2, w3],
-        r = 2,
-        revs = Revs,
-        latest = Latest
-    }.
+collapse_duplicate_revs_int([]) ->
+    [];
+
+collapse_duplicate_revs_int([{ok, Doc1}, {ok, Doc2} | Rest]) ->
+    {D1, R1} = Doc1#doc.revs,
+    {D2, R2} = Doc2#doc.revs,
+    Head = case D1 == D2 andalso lists:prefix(R1, R2) of
+        true -> [];
+        false -> [{ok, Doc1}]
+    end,
+    Head ++ collapse_duplicate_revs([{ok, Doc2} | Rest]);
+
+collapse_duplicate_revs_int([Reply | Rest]) ->
+    [Reply | collapse_duplicate_revs(Rest)].
 
 
-revs() -> [{1,<<"foo">>}, {1,<<"bar">>}, {1,<<"baz">>}].
-
-
-foo1() -> {ok, #doc{revs = {1, [<<"foo">>]}}}.
-foo2() -> {ok, #doc{revs = {2, [<<"foo2">>, <<"foo">>]}}}.
-fooNF() -> {{not_found, missing}, {1,<<"foo">>}}.
-bar1() -> {ok, #doc{revs = {1, [<<"bar">>]}}}.
-barNF() -> {{not_found, missing}, {1,<<"bar">>}}.
-bazNF() -> {{not_found, missing}, {1,<<"baz">>}}.
-baz1() -> {ok, #doc{revs = {1, [<<"baz">>]}}}.
-
-
-
-open_doc_revs_test_() ->
-    {
-        foreach,
-        fun setup/0,
-        fun teardown/1,
-        [
-            check_empty_response_not_quorum(),
-            check_basic_response(),
-            check_finish_quorum(),
-            check_finish_quorum_newer(),
-            check_no_quorum_on_second(),
-            check_done_on_third(),
-            check_specific_revs_first_msg(),
-            check_revs_done_on_agreement(),
-            check_latest_true(),
-            check_ancestor_counted_in_quorum(),
-            check_not_found_counts_for_descendant(),
-            check_worker_error_skipped(),
-            check_quorum_only_counts_valid_responses(),
-            check_empty_list_when_no_workers_reply(),
-            check_not_found_replies_are_removed_when_doc_found(),
-            check_not_found_returned_when_one_of_docs_not_found(),
-            check_not_found_returned_when_doc_not_found()
-        ]
-    }.
-
-
-% Tests for revs=all
-
-
-check_empty_response_not_quorum() ->
-    % Simple smoke test that we don't think we're
-    % done with a first empty response
-    ?_assertMatch(
-        {ok, #state{workers = [w2, w3]}},
-        handle_message({ok, []}, w1, state0(all, false))
-    ).
-
-
-check_basic_response() ->
-    % Check that we've handle a response
-    ?_assertMatch(
-        {ok, #state{reply_count = 1, workers = [w2, w3]}},
-        handle_message({ok, [foo1(), bar1()]}, w1, state0(all, false))
-    ).
-
-
-check_finish_quorum() ->
-    % Two messages with the same revisions means we're done
-    ?_test(begin
-        S0 = state0(all, false),
-        {ok, S1} = handle_message({ok, [foo1(), bar1()]}, w1, S0),
-        Expect = {stop, [bar1(), foo1()]},
-        ?assertEqual(Expect, handle_message({ok, [foo1(), bar1()]}, w2, S1))
-    end).
-
-
-check_finish_quorum_newer() ->
-    % We count a descendant of a revision for quorum so
-    % foo1 should count for foo2 which means we're finished.
-    % We also validate that read_repair was triggered.
-    ?_test(begin
-        S0 = state0(all, false),
-        {ok, S1} = handle_message({ok, [foo1(), bar1()]}, w1, S0),
-        Expect = {stop, [bar1(), foo2()]},
-        ok = meck:reset(fabric),
-        ?assertEqual(Expect, handle_message({ok, [foo2(), bar1()]}, w2, S1)),
-        ok = meck:wait(fabric, update_docs, '_', 5000),
-        ?assertMatch(
-            [{_, {fabric, update_docs, [_, _, _]}, _}],
-            meck:history(fabric)
-        )
-    end).
-
-
-check_no_quorum_on_second() ->
-    % Quorum not yet met for the foo revision so we
-    % would wait for w3
-    ?_test(begin
-        S0 = state0(all, false),
-        {ok, S1} = handle_message({ok, [foo1(), bar1()]}, w1, S0),
-        ?assertMatch(
-            {ok, #state{workers = [w3]}},
-            handle_message({ok, [bar1()]}, w2, S1)
-        )
-    end).
-
-
-check_done_on_third() ->
-    % The third message of three means we're done no matter
-    % what. Every revision seen in this pattern should be
-    % included.
-    ?_test(begin
-        S0 = state0(all, false),
-        {ok, S1} = handle_message({ok, [foo1(), bar1()]}, w1, S0),
-        {ok, S2} = handle_message({ok, [bar1()]}, w2, S1),
-        Expect = {stop, [bar1(), foo1()]},
-        ?assertEqual(Expect, handle_message({ok, [bar1()]}, w3, S2))
-    end).
-
-
-% Tests for a specific list of revs
-
-
-check_specific_revs_first_msg() ->
-    ?_test(begin
-        S0 = state0(revs(), false),
-        ?assertMatch(
-            {ok, #state{reply_count = 1, workers = [w2, w3]}},
-            handle_message({ok, [foo1(), bar1(), bazNF()]}, w1, S0)
-        )
-    end).
-
-
-check_revs_done_on_agreement() ->
-    ?_test(begin
-        S0 = state0(revs(), false),
-        Msg = {ok, [foo1(), bar1(), bazNF()]},
-        {ok, S1} = handle_message(Msg, w1, S0),
-        Expect = {stop, [bar1(), foo1(), bazNF()]},
-        ?assertEqual(Expect, handle_message(Msg, w2, S1))
-    end).
-
-
-check_latest_true() ->
-    ?_test(begin
-        S0 = state0(revs(), true),
-        Msg1 = {ok, [foo2(), bar1(), bazNF()]},
-        Msg2 = {ok, [foo2(), bar1(), bazNF()]},
-        {ok, S1} = handle_message(Msg1, w1, S0),
-        Expect = {stop, [bar1(), foo2(), bazNF()]},
-        ?assertEqual(Expect, handle_message(Msg2, w2, S1))
-    end).
-
-
-check_ancestor_counted_in_quorum() ->
-    ?_test(begin
-        S0 = state0(revs(), true),
-        Msg1 = {ok, [foo1(), bar1(), bazNF()]},
-        Msg2 = {ok, [foo2(), bar1(), bazNF()]},
-        Expect = {stop, [bar1(), foo2(), bazNF()]},
-
-        % Older first
-        {ok, S1} = handle_message(Msg1, w1, S0),
-        ?assertEqual(Expect, handle_message(Msg2, w2, S1)),
-
-        % Newer first
-        {ok, S2} = handle_message(Msg2, w2, S0),
-        ?assertEqual(Expect, handle_message(Msg1, w1, S2))
-    end).
-
-
-check_not_found_counts_for_descendant() ->
-    ?_test(begin
-        S0 = state0(revs(), true),
-        Msg1 = {ok, [foo1(), bar1(), bazNF()]},
-        Msg2 = {ok, [foo1(), bar1(), baz1()]},
-        Expect = {stop, [bar1(), baz1(), foo1()]},
-
-        % not_found first
-        {ok, S1} = handle_message(Msg1, w1, S0),
-        ?assertEqual(Expect, handle_message(Msg2, w2, S1)),
-
-        % not_found second
-        {ok, S2} = handle_message(Msg2, w2, S0),
-        ?assertEqual(Expect, handle_message(Msg1, w1, S2))
-    end).
-
-
-check_worker_error_skipped() ->
-    ?_test(begin
-        S0 = state0(revs(), true),
-        Msg1 = {ok, [foo1(), bar1(), baz1()]},
-        Msg2 = {rexi_EXIT, reason},
-        Msg3 = {ok, [foo1(), bar1(), baz1()]},
-        Expect = {stop, [bar1(), baz1(), foo1()]},
-
-        {ok, S1} = handle_message(Msg1, w1, S0),
-        {ok, S2} = handle_message(Msg2, w2, S1),
-        ?assertEqual(Expect, handle_message(Msg3, w3, S2))
-    end).
-
-
-check_quorum_only_counts_valid_responses() ->
-    ?_test(begin
-        S0 = state0(revs(), true),
-        Msg1 = {rexi_EXIT, reason},
-        Msg2 = {rexi_EXIT, reason},
-        Msg3 = {ok, [foo1(), bar1(), baz1()]},
-        Expect = {stop, [bar1(), baz1(), foo1()]},
-
-        {ok, S1} = handle_message(Msg1, w1, S0),
-        {ok, S2} = handle_message(Msg2, w2, S1),
-        ?assertEqual(Expect, handle_message(Msg3, w3, S2))
-    end).
-
-
-check_empty_list_when_no_workers_reply() ->
-    ?_test(begin
-        S0 = state0(revs(), true),
-        Msg1 = {rexi_EXIT, reason},
-        Msg2 = {rexi_EXIT, reason},
-        Msg3 = {rexi_DOWN, nodedown, {nil, node()}, nil},
-        Expect = {stop, all_workers_died},
-
-        {ok, S1} = handle_message(Msg1, w1, S0),
-        {ok, S2} = handle_message(Msg2, w2, S1),
-        ?assertEqual(Expect, handle_message(Msg3, w3, S2))
-    end).
-
-
-check_not_found_replies_are_removed_when_doc_found() ->
-    ?_test(begin
-        Replies = replies_to_dict([foo1(), bar1(), fooNF()]),
-        Expect = replies_to_dict([foo1(), bar1()]),
-        ?assertEqual(Expect, filter_reply(Replies))
-    end).
-
-check_not_found_returned_when_one_of_docs_not_found() ->
-    ?_test(begin
-        Replies = replies_to_dict([foo1(), foo2(), barNF()]),
-        Expect = replies_to_dict([foo1(), foo2(), barNF()]),
-        ?assertEqual(Expect, filter_reply(Replies))
-    end).
-
-check_not_found_returned_when_doc_not_found() ->
-    ?_test(begin
-        Replies = replies_to_dict([fooNF(), barNF(), bazNF()]),
-        Expect = replies_to_dict([fooNF(), barNF(), bazNF()]),
-        ?assertEqual(Expect, filter_reply(Replies))
-    end).
-
-replies_to_dict(Replies) ->
-    [reply_to_element(R) || R <- Replies].
-
-reply_to_element({ok, #doc{revs = Revs}} = Reply) ->
-    {_, [Rev | _]} = Revs,
-    {{Rev, Revs}, {Reply, 1}};
-reply_to_element(Reply) ->
-    {Reply, {Reply, 1}}.
-
--endif.
+%% -ifdef(TEST).
+%% -include_lib("eunit/include/eunit.hrl").
+%%
+%%
+%% setup_all() ->
+%%     config:start_link([]),
+%%     meck:new([fabric, couch_stats, couch_log]),
+%%     meck:new(fabric_util, [passthrough]),
+%%     meck:expect(fabric, update_docs, fun(_, _, _) -> {ok, nil} end),
+%%     meck:expect(couch_stats, increment_counter, fun(_) -> ok end),
+%%     meck:expect(couch_log, notice, fun(_, _) -> ok end),
+%%     meck:expect(fabric_util, cleanup, fun(_) -> ok end).
+%%
+%%
+%%
+%% teardown_all(_) ->
+%%     meck:unload(),
+%%     config:stop().
+%%
+%%
+%% setup() ->
+%%     meck:reset([
+%%         couch_log,
+%%         couch_stats,
+%%         fabric,
+%%         fabric_util
+%%     ]).
+%%
+%%
+%% teardown(_) ->
+%%     ok.
+%%
+%%
+%% state0(Revs, Latest) ->
+%%     #state{
+%%         worker_count = 3,
+%%         workers =
+%%             [#shard{node='node1'}, #shard{node='node2'}, #shard{node='node3'}],
+%%         r = 2,
+%%         revs = Revs,
+%%         latest = Latest
+%%     }.
+%%
+%%
+%% revs() -> [{1,<<"foo">>}, {1,<<"bar">>}, {1,<<"baz">>}].
+%%
+%%
+%% foo1() -> {ok, #doc{revs = {1, [<<"foo">>]}}}.
+%% foo2() -> {ok, #doc{revs = {2, [<<"foo2">>, <<"foo">>]}}}.
+%% foo2stemmed() -> {ok, #doc{revs = {2, [<<"foo2">>]}}}.
+%% fooNF() -> {{not_found, missing}, {1,<<"foo">>}}.
+%% foo2NF() -> {{not_found, missing}, {2, <<"foo2">>}}.
+%% bar1() -> {ok, #doc{revs = {1, [<<"bar">>]}}}.
+%% barNF() -> {{not_found, missing}, {1,<<"bar">>}}.
+%% bazNF() -> {{not_found, missing}, {1,<<"baz">>}}.
+%% baz1() -> {ok, #doc{revs = {1, [<<"baz">>]}}}.
+%%
+%%
+%%
+%% open_doc_revs_test_() ->
+%%     {
+%%         setup,
+%%         fun setup_all/0,
+%%         fun teardown_all/1,
+%%         {
+%%             foreach,
+%%             fun setup/0,
+%%             fun teardown/1,
+%%             [
+%%                 check_empty_response_not_quorum(),
+%%                 check_basic_response(),
+%%                 check_finish_quorum(),
+%%                 check_finish_quorum_newer(),
+%%                 check_no_quorum_on_second(),
+%%                 check_done_on_third(),
+%%                 check_specific_revs_first_msg(),
+%%                 check_revs_done_on_agreement(),
+%%                 check_latest_true(),
+%%                 check_ancestor_counted_in_quorum(),
+%%                 check_not_found_counts_for_descendant(),
+%%                 check_worker_error_skipped(),
+%%                 check_quorum_only_counts_valid_responses(),
+%%                 check_empty_list_when_no_workers_reply(),
+%%                 check_node_rev_stored(),
+%%                 check_node_rev_store_head_only(),
+%%                 check_node_rev_store_multiple(),
+%%                 check_node_rev_dont_store_errors(),
+%%                 check_node_rev_store_non_errors(),
+%%                 check_node_rev_store_concatenate(),
+%%                 check_node_rev_store_concantenate_multiple(),
+%%                 check_node_rev_unmodified_on_down_or_exit(),
+%%                 check_not_found_replies_are_removed_when_doc_found(),
+%%                 check_not_found_returned_when_one_of_docs_not_found(),
+%%                 check_not_found_returned_when_doc_not_found(),
+%%                 check_longer_rev_list_returned(),
+%%                 check_longer_rev_list_not_combined(),
+%%                 check_not_found_removed_and_longer_rev_list()
+%%             ]
+%%         }
+%%     }.
+%%
+%%
+%% % Tests for revs=all
+%%
+%%
+%% check_empty_response_not_quorum() ->
+%%     % Simple smoke test that we don't think we're
+%%     % done with a first empty response
+%%     W1 = #shard{node='node1'},
+%%     W2 = #shard{node='node2'},
+%%     W3 = #shard{node='node3'},
+%%     ?_assertMatch(
+%%         {ok, #state{workers = [W2, W3]}},
+%%         handle_message({ok, []}, W1, state0(all, false))
+%%     ).
+%%
+%%
+%% check_basic_response() ->
+%%     % Check that we've handle a response
+%%     W1 = #shard{node='node1'},
+%%     W2 = #shard{node='node2'},
+%%     W3 = #shard{node='node3'},
+%%     ?_assertMatch(
+%%         {ok, #state{reply_count = 1, workers = [W2, W3]}},
+%%         handle_message({ok, [foo1(), bar1()]}, W1, state0(all, false))
+%%     ).
+%%
+%%
+%% check_finish_quorum() ->
+%%     % Two messages with the same revisions means we're done
+%%     ?_test(begin
+%%         W1 = #shard{node='node1'},
+%%         W2 = #shard{node='node2'},
+%%         S0 = state0(all, false),
+%%         {ok, S1} = handle_message({ok, [foo1(), bar1()]}, W1, S0),
+%%         Expect = {stop, [bar1(), foo1()]},
+%%         ?assertEqual(Expect, handle_message({ok, [foo1(), bar1()]}, W2, S1))
+%%     end).
+%%
+%%
+%% check_finish_quorum_newer() ->
+%%     % We count a descendant of a revision for quorum so
+%%     % foo1 should count for foo2 which means we're finished.
+%%     % We also validate that read_repair was triggered.
+%%     ?_test(begin
+%%         W1 = #shard{node='node1'},
+%%         W2 = #shard{node='node2'},
+%%         S0 = state0(all, false),
+%%         {ok, S1} = handle_message({ok, [foo1(), bar1()]}, W1, S0),
+%%         Expect = {stop, [bar1(), foo2()]},
+%%         ok = meck:reset(fabric),
+%%         ?assertEqual(Expect, handle_message({ok, [foo2(), bar1()]}, W2, S1)),
+%%         ok = meck:wait(fabric, update_docs, '_', 5000),
+%%         ?assertMatch(
+%%             [{_, {fabric, update_docs, [_, _, _]}, _}],
+%%             meck:history(fabric)
+%%         )
+%%     end).
+%%
+%%
+%% check_no_quorum_on_second() ->
+%%     % Quorum not yet met for the foo revision so we
+%%     % would wait for w3
+%%     ?_test(begin
+%%         W1 = #shard{node='node1'},
+%%         W2 = #shard{node='node2'},
+%%         W3 = #shard{node='node3'},
+%%         S0 = state0(all, false),
+%%         {ok, S1} = handle_message({ok, [foo1(), bar1()]}, W1, S0),
+%%         ?assertMatch(
+%%             {ok, #state{workers = [W3]}},
+%%             handle_message({ok, [bar1()]}, W2, S1)
+%%         )
+%%     end).
+%%
+%%
+%% check_done_on_third() ->
+%%     % The third message of three means we're done no matter
+%%     % what. Every revision seen in this pattern should be
+%%     % included.
+%%     ?_test(begin
+%%         W1 = #shard{node='node1'},
+%%         W2 = #shard{node='node2'},
+%%         W3 = #shard{node='node3'},
+%%         S0 = state0(all, false),
+%%         {ok, S1} = handle_message({ok, [foo1(), bar1()]}, W1, S0),
+%%         {ok, S2} = handle_message({ok, [bar1()]}, W2, S1),
+%%         Expect = {stop, [bar1(), foo1()]},
+%%         ?assertEqual(Expect, handle_message({ok, [bar1()]}, W3, S2))
+%%     end).
+%%
+%%
+%% % Tests for a specific list of revs
+%%
+%%
+%% check_specific_revs_first_msg() ->
+%%     ?_test(begin
+%%         W1 = #shard{node='node1'},
+%%         W2 = #shard{node='node2'},
+%%         W3 = #shard{node='node3'},
+%%         S0 = state0(revs(), false),
+%%         ?assertMatch(
+%%             {ok, #state{reply_count = 1, workers = [W2, W3]}},
+%%             handle_message({ok, [foo1(), bar1(), bazNF()]}, W1, S0)
+%%         )
+%%     end).
+%%
+%%
+%% check_revs_done_on_agreement() ->
+%%     ?_test(begin
+%%         W1 = #shard{node='node1'},
+%%         W2 = #shard{node='node2'},
+%%         S0 = state0(revs(), false),
+%%         Msg = {ok, [foo1(), bar1(), bazNF()]},
+%%         {ok, S1} = handle_message(Msg, W1, S0),
+%%         Expect = {stop, [bar1(), foo1(), bazNF()]},
+%%         ?assertEqual(Expect, handle_message(Msg, W2, S1))
+%%     end).
+%%
+%%
+%% check_latest_true() ->
+%%     ?_test(begin
+%%         W1 = #shard{node='node1'},
+%%         W2 = #shard{node='node2'},
+%%         S0 = state0(revs(), true),
+%%         Msg1 = {ok, [foo2(), bar1(), bazNF()]},
+%%         Msg2 = {ok, [foo2(), bar1(), bazNF()]},
+%%         {ok, S1} = handle_message(Msg1, W1, S0),
+%%         Expect = {stop, [bar1(), foo2(), bazNF()]},
+%%         ?assertEqual(Expect, handle_message(Msg2, W2, S1))
+%%     end).
+%%
+%%
+%% check_ancestor_counted_in_quorum() ->
+%%     ?_test(begin
+%%         W1 = #shard{node='node1'},
+%%         W2 = #shard{node='node2'},
+%%         S0 = state0(revs(), true),
+%%         Msg1 = {ok, [foo1(), bar1(), bazNF()]},
+%%         Msg2 = {ok, [foo2(), bar1(), bazNF()]},
+%%         Expect = {stop, [bar1(), foo2(), bazNF()]},
+%%
+%%         % Older first
+%%         {ok, S1} = handle_message(Msg1, W1, S0),
+%%         ?assertEqual(Expect, handle_message(Msg2, W2, S1)),
+%%
+%%         % Newer first
+%%         {ok, S2} = handle_message(Msg2, W2, S0),
+%%         ?assertEqual(Expect, handle_message(Msg1, W1, S2))
+%%     end).
+%%
+%%
+%% check_not_found_counts_for_descendant() ->
+%%     ?_test(begin
+%%         W1 = #shard{node='node1'},
+%%         W2 = #shard{node='node2'},
+%%         S0 = state0(revs(), true),
+%%         Msg1 = {ok, [foo1(), bar1(), bazNF()]},
+%%         Msg2 = {ok, [foo1(), bar1(), baz1()]},
+%%         Expect = {stop, [bar1(), baz1(), foo1()]},
+%%
+%%         % not_found first
+%%         {ok, S1} = handle_message(Msg1, W1, S0),
+%%         ?assertEqual(Expect, handle_message(Msg2, W2, S1)),
+%%
+%%         % not_found second
+%%         {ok, S2} = handle_message(Msg2, W2, S0),
+%%         ?assertEqual(Expect, handle_message(Msg1, W1, S2))
+%%     end).
+%%
+%%
+%% check_worker_error_skipped() ->
+%%     ?_test(begin
+%%         W1 = #shard{node='node1'},
+%%         W2 = #shard{node='node2'},
+%%         W3 = #shard{node='node3'},
+%%         S0 = state0(revs(), true),
+%%         Msg1 = {ok, [foo1(), bar1(), baz1()]},
+%%         Msg2 = {rexi_EXIT, reason},
+%%         Msg3 = {ok, [foo1(), bar1(), baz1()]},
+%%         Expect = {stop, [bar1(), baz1(), foo1()]},
+%%
+%%         {ok, S1} = handle_message(Msg1, W1, S0),
+%%         {ok, S2} = handle_message(Msg2, W2, S1),
+%%         ?assertEqual(Expect, handle_message(Msg3, W3, S2))
+%%     end).
+%%
+%%
+%% check_quorum_only_counts_valid_responses() ->
+%%     ?_test(begin
+%%         W1 = #shard{node='node1'},
+%%         W2 = #shard{node='node2'},
+%%         W3 = #shard{node='node3'},
+%%         S0 = state0(revs(), true),
+%%         Msg1 = {rexi_EXIT, reason},
+%%         Msg2 = {rexi_EXIT, reason},
+%%         Msg3 = {ok, [foo1(), bar1(), baz1()]},
+%%         Expect = {stop, [bar1(), baz1(), foo1()]},
+%%
+%%         {ok, S1} = handle_message(Msg1, W1, S0),
+%%         {ok, S2} = handle_message(Msg2, W2, S1),
+%%         ?assertEqual(Expect, handle_message(Msg3, W3, S2))
+%%     end).
+%%
+%%
+%% check_empty_list_when_no_workers_reply() ->
+%%     ?_test(begin
+%%         W1 = #shard{node='node1'},
+%%         W2 = #shard{node='node2'},
+%%         W3 = #shard{node='node3'},
+%%         S0 = state0(revs(), true),
+%%         Msg1 = {rexi_EXIT, reason},
+%%         Msg2 = {rexi_EXIT, reason},
+%%         Msg3 = {rexi_DOWN, nodedown, {nil, node()}, nil},
+%%         Expect = {stop, all_workers_died},
+%%
+%%         {ok, S1} = handle_message(Msg1, W1, S0),
+%%         {ok, S2} = handle_message(Msg2, W2, S1),
+%%         ?assertEqual(Expect, handle_message(Msg3, W3, S2))
+%%     end).
+%%
+%%
+%% check_node_rev_stored() ->
+%%     ?_test(begin
+%%         W1 = #shard{node = node1},
+%%         S0 = state0([], true),
+%%
+%%         {ok, S1} = handle_message({ok, [foo1()]}, W1, S0),
+%%         ?assertEqual([{node1, [{1, <<"foo">>}]}], S1#state.node_revs)
+%%     end).
+%%
+%%
+%% check_node_rev_store_head_only() ->
+%%     ?_test(begin
+%%         W1 = #shard{node = node1},
+%%         S0 = state0([], true),
+%%
+%%         {ok, S1} = handle_message({ok, [foo2()]}, W1, S0),
+%%         ?assertEqual([{node1, [{2, <<"foo2">>}]}], S1#state.node_revs)
+%%     end).
+%%
+%%
+%% check_node_rev_store_multiple() ->
+%%     ?_test(begin
+%%         W1 = #shard{node = node1},
+%%         S0 = state0([], true),
+%%
+%%         {ok, S1} = handle_message({ok, [foo1(), foo2()]}, W1, S0),
+%%         ?assertEqual(
+%%                 [{node1, [{2, <<"foo2">>}, {1, <<"foo">>}]}],
+%%                 S1#state.node_revs
+%%             )
+%%     end).
+%%
+%%
+%% check_node_rev_dont_store_errors() ->
+%%     ?_test(begin
+%%         W1 = #shard{node = node1},
+%%         S0 = state0([], true),
+%%
+%%         {ok, S1} = handle_message({ok, [barNF()]}, W1, S0),
+%%         ?assertEqual([], S1#state.node_revs)
+%%     end).
+%%
+%%
+%% check_node_rev_store_non_errors() ->
+%%     ?_test(begin
+%%         W1 = #shard{node = node1},
+%%         S0 = state0([], true),
+%%
+%%         {ok, S1} = handle_message({ok, [foo1(), barNF()]}, W1, S0),
+%%         ?assertEqual([{node1, [{1, <<"foo">>}]}], S1#state.node_revs)
+%%     end).
+%%
+%%
+%% check_node_rev_store_concatenate() ->
+%%     ?_test(begin
+%%         W2 = #shard{node = node2},
+%%         S0 = state0([], true),
+%%         S1 = S0#state{node_revs = [{node1, [{1, <<"foo">>}]}]},
+%%
+%%         {ok, S2} = handle_message({ok, [foo2()]}, W2, S1),
+%%         ?assertEqual(
+%%                 [{node2, [{2, <<"foo2">>}]}, {node1, [{1, <<"foo">>}]}],
+%%                 S2#state.node_revs
+%%             )
+%%     end).
+%%
+%%
+%% check_node_rev_store_concantenate_multiple() ->
+%%     ?_test(begin
+%%         W2 = #shard{node = node2},
+%%         S0 = state0([], true),
+%%         S1 = S0#state{node_revs = [{node1, [{1, <<"foo">>}]}]},
+%%
+%%         {ok, S2} = handle_message({ok, [foo2(), bar1()]}, W2, S1),
+%%         ?assertEqual(
+%%                 [
+%%                     {node2, [{1, <<"bar">>}, {2, <<"foo2">>}]},
+%%                     {node1, [{1, <<"foo">>}]}
+%%                 ],
+%%                 S2#state.node_revs
+%%             )
+%%     end).
+%%
+%%
+%% check_node_rev_unmodified_on_down_or_exit() ->
+%%     ?_test(begin
+%%         W2 = #shard{node = node2},
+%%         S0 = state0([], true),
+%%         S1 = S0#state{node_revs = [{node1, [{1, <<"foo">>}]}]},
+%%
+%%         Down = {rexi_DOWN, nodedown, {nil, node()}, nil},
+%%         {ok, S2} = handle_message(Down, W2, S1),
+%%         ?assertEqual(
+%%                 [{node1, [{1, <<"foo">>}]}],
+%%                 S2#state.node_revs
+%%             ),
+%%
+%%         Exit = {rexi_EXIT, reason},
+%%         {ok, S3} = handle_message(Exit, W2, S1),
+%%         ?assertEqual(
+%%                 [{node1, [{1, <<"foo">>}]}],
+%%                 S3#state.node_revs
+%%             )
+%%     end).
+%%
+%%
+%% check_not_found_replies_are_removed_when_doc_found() ->
+%%     ?_test(begin
+%%         Replies = replies_to_dict([foo1(), bar1(), fooNF()]),
+%%         Expect = [bar1(), foo1()],
+%%         ?assertEqual(Expect, dict_format_replies(Replies))
+%%     end).
+%%
+%% check_not_found_returned_when_one_of_docs_not_found() ->
+%%     ?_test(begin
+%%         Replies = replies_to_dict([foo1(), foo2(), barNF()]),
+%%         Expect = [foo1(), foo2(), barNF()],
+%%         ?assertEqual(Expect, dict_format_replies(Replies))
+%%     end).
+%%
+%% check_not_found_returned_when_doc_not_found() ->
+%%     ?_test(begin
+%%         Replies = replies_to_dict([fooNF(), barNF(), bazNF()]),
+%%         Expect = [barNF(), bazNF(), fooNF()],
+%%         ?assertEqual(Expect, dict_format_replies(Replies))
+%%     end).
+%%
+%% check_longer_rev_list_returned() ->
+%%     ?_test(begin
+%%         Replies = replies_to_dict([foo2(), foo2stemmed()]),
+%%         Expect = [foo2()],
+%%         ?assertEqual(2, length(Replies)),
+%%         ?assertEqual(Expect, dict_format_replies(Replies))
+%%     end).
+%%
+%% check_longer_rev_list_not_combined() ->
+%%     ?_test(begin
+%%         Replies = replies_to_dict([foo2(), foo2stemmed(), bar1()]),
+%%         Expect = [bar1(), foo2()],
+%%         ?assertEqual(3, length(Replies)),
+%%         ?assertEqual(Expect, dict_format_replies(Replies))
+%%     end).
+%%
+%% check_not_found_removed_and_longer_rev_list() ->
+%%     ?_test(begin
+%%         Replies = replies_to_dict([foo2(), foo2stemmed(), foo2NF()]),
+%%         Expect = [foo2()],
+%%         ?assertEqual(3, length(Replies)),
+%%         ?assertEqual(Expect, dict_format_replies(Replies))
+%%     end).
+%%
+%%
+%% replies_to_dict(Replies) ->
+%%     [reply_to_element(R) || R <- Replies].
+%%
+%% reply_to_element({ok, #doc{revs = Revs}} = Reply) ->
+%%     {_, [Rev | _]} = Revs,
+%%     {{Rev, Revs}, {Reply, 1}};
+%% reply_to_element(Reply) ->
+%%     {Reply, {Reply, 1}}.
+%%
+%% -endif.

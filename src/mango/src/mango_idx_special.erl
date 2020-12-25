@@ -28,6 +28,7 @@
 
 -include_lib("couch/include/couch_db.hrl").
 -include("mango_idx.hrl").
+-include_lib("couch_views/include/couch_views.hrl").
 
 
 validate(_) ->
@@ -55,7 +56,8 @@ to_json(#idx{def=all_docs}) ->
             {<<"fields">>, [{[
                 {<<"_id">>, <<"asc">>}
             ]}]}
-        ]}}
+        ]}},
+        {build_status, ?INDEX_READY}
     ]}.
 
 
@@ -63,9 +65,11 @@ columns(#idx{def=all_docs}) ->
     [<<"_id">>].
 
 
-is_usable(#idx{def=all_docs}, Selector, _) ->
+is_usable(#idx{def=all_docs}, _Selector, []) ->
+    true;
+is_usable(#idx{def=all_docs} = Idx, Selector, SortFields) ->
     Fields = mango_idx_view:indexable_fields(Selector),
-    lists:member(<<"_id">>, Fields).
+    lists:member(<<"_id">>, Fields) and can_use_sort(Idx, SortFields, Selector).
 
 
 start_key([{'$gt', Key, _, _}]) ->
@@ -96,3 +100,10 @@ end_key([{_, _, '$lte', Key}]) ->
 end_key([{'$eq', Key, '$eq', Key}]) ->
     false = mango_json:special(Key),
     Key.
+
+
+can_use_sort(_Idx, [], _Selector) ->
+    true;
+can_use_sort(Idx, SortFields, _Selector) ->
+    Cols = columns(Idx),
+    lists:prefix(SortFields, Cols).
