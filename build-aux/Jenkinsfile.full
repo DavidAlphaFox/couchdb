@@ -147,13 +147,13 @@ def generateNativeStage(platform) {
                     powershell( script: """
                       .\\..\\..\\couchdb-glazier\\bin\\shell.ps1
                       Set-Item -Path env:GRADLE_OPTS -Value '-Dorg.gradle.daemon=false'
-                      make -f Makefile.win elixir-search
+                      make -f Makefile.win elixir-search ERLANG_COOKIE=crumbles
                     """, label: 'Clouseau tests')
 
                     powershell( script: """
                       .\\..\\..\\couchdb-glazier\\bin\\shell.ps1
                       Set-Item -Path env:GRADLE_OPTS -Value '-Dorg.gradle.daemon=false'
-                      make -f Makefile.win mango-test
+                      make -f Makefile.win mango-test ERLANG_COOKIE=crumbles
                     """, label: 'Mango tests')
 
                     powershell( script: '.\\..\\..\\couchdb-glazier\\bin\\shell.ps1; Write-Host "NOT AVAILABLE: make -f Makefile.win weatherreport-test"', label: 'N/A Weatherreport tests')
