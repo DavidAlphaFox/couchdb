@@ -11,3 +11,5 @@ Our JIRA system no longer accepts new issues, but may have important historical
 information:
 
     https://issues.apache.org/jira/browse/CouchDB
+
+Squash the Bugs! 🐛
