@@ -60,8 +60,8 @@ init(_) ->
     ets:new(?BY_DBSIG, [set, named_table]),
     ets:new(?BY_REF, [set, named_table]),
     couch_event:link_listener(?MODULE, handle_db_event, nil, [all_dbs]),
-    configure_ibrowse(nouveau_util:nouveau_url()),
-    ok = config:listen_for_changes(?MODULE, nil),
+    configure_gun(nouveau_util:nouveau_url()),
+    ok = config:listen_for_changes(?MODULE, nouveau_util:nouveau_url()),
     {ok, nil}.
 
 handle_call({update, #index{} = Index0}, From, State) ->
@@ -133,8 +133,10 @@ handle_db_event(_DbName, _Event, State) ->
     {ok, State}.
 
 handle_config_change("nouveau", "url", URL, _Persist, State) ->
-    configure_ibrowse(URL),
-    {ok, State};
+    #{host := Host, port := Port} = uri_string:parse(State),
+    gun_pool:stop_pool(Host, Port),
+    configure_gun(URL),
+    {ok, URL};
 handle_config_change(_Section, _Key, _Value, _Persist, State) ->
     {ok, State}.
 
@@ -147,15 +149,29 @@ handle_config_terminate(_Server, _Reason, _State) ->
         restart_config_listener
     ).
 
-configure_ibrowse(URL) ->
+configure_gun(URL) ->
     #{host := Host, port := Port} = uri_string:parse(URL),
-    ibrowse:set_max_sessions(
-        Host,
-        Port,
-        nouveau_util:max_sessions()
-    ),
-    ibrowse:set_max_pipeline_size(
-        Host,
-        Port,
-        nouveau_util:max_pipeline_size()
-    ).
+    CACertFile = config:get("nouveau", "ssl_cacert_file"),
+    KeyFile = config:get("nouveau", "ssl_key_file"),
+    CertFile = config:get("nouveau", "ssl_cert_file"),
+    Password = config:get("nouveau", "ssl_password"),
+    BaseOptions = #{size => nouveau_util:max_sessions()},
+    Options =
+        if
+            KeyFile /= undefined andalso CertFile /= undefined ->
+                CertKeyConf0 = #{
+                    certfile => CertFile,
+                    keyfile => KeyFile,
+                    password => Password,
+                    cacertfile => CACertFile
+                },
+                CertKeyConf1 = maps:filter(fun remove_undefined/2, CertKeyConf0),
+                TLSOptions = [{certs_keys, [CertKeyConf1]}],
+                BaseOptions#{conn_opts => #{tls_opts => TLSOptions}};
+            true ->
+                BaseOptions
+        end,
+    gun_pool:start_pool(Host, Port, Options).
+
+remove_undefined(_Key, Value) ->
+    Value /= undefined.
